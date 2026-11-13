@@ -7,6 +7,8 @@ let accountFetchSequence = 0, accountMarkup = '', accountAddPending = false;
 const videoFolderFeedback = new Map(), videoApprovalErrors = new Map(), videoApprovalPending = new Set(), videoApprovalJobs = new Map();
 const videoDeleteFeedback = new Map(), videoDeletePending = new Set();
 let videoRows = [], videoFetchSequence = 0, videoMarkup = '';
+let videoBatches = null;
+const videoBatchPending = new Set(), videoBatchFeedback = new Map();
 const refreshFailures = new Map();
 function refreshFailed(kind, error) {
   const detail = error.message === 'Failed to fetch' ? '服务连接暂时中断' : error.message;
@@ -89,6 +91,8 @@ async function refresh() {
     refreshRecovered('工作台');
     document.querySelector('#status').textContent = next.running ? '● 正在运行' : next.returncode === null ? '● 已就绪' : next.returncode === 0 ? '● 运行完成' : '● 运行未完成，请查看日志';
     document.querySelector('#runlog').textContent = next.log || '暂无运行日志';
+    const archiveButton=document.querySelector('#archive-run');
+    if (archiveButton) archiveButton.disabled=next.running || !(next.tasks||[]).length || !next.run_id;
     if (dirty || captionRequests || document.activeElement?.closest('#rows')) return;
     data = next;
     const ids = new Set(data.rows.map(r => r.record_id));
@@ -515,7 +519,10 @@ async function run() {
       await saveRows(false);
       if (dirty) throw Error('提示词有新的修改，请保存后再开启新任务');
     }
-    const result = await api('/api/run',{});
+    const result = await api('/api/run',{
+      ...(Array.isArray(current.recovery_request_ids) && current.recovery_request_ids.length
+        ? {recovery_request_ids:current.recovery_request_ids} : {})
+    });
     msg((result.message || (result.resumed ? '继续上次'+result.script_count+'个脚本，已完成视频不重复生成' : '已启动新任务'))
       + (current.can_resume && pendingEdits ? '。未保存修改保留供后续新任务' : ''));
     await refresh();
@@ -527,6 +534,19 @@ async function previewClearHistory() {
     const result = await api('/api/history/preview');
     msg('历史清理仅提供预览，未删除记录或文件。\n' + JSON.stringify(result, null, 2));
   } catch (e) { msg('历史清理预览失败：' + e.message); }
+}
+async function archiveStoppedRun() {
+  try {
+    const current=await api('/api/state');
+    if (current.running) throw Error('任务仍在运行，请先停止');
+    const taskIds=(current.tasks||[]).map(task=>task.id);
+    if (!current.run_id || !taskIds.length) throw Error('没有可清理的当前任务');
+    if (!confirm(`删除运行 ${current.run_id} 的 ${taskIds.length} 条未完成任务及对应脚本文件？未知额度记录会保留为审计账本。`)) return;
+    const result=await api('/api/run/archive',{run_id:current.run_id,task_ids:taskIds});
+    msg(`已清理 ${result.removed_tasks} 条旧任务；删除脚本 ${result.deleted_script_files.length} 个。${result.file_errors.length ? '\n文件清理错误：'+result.file_errors.join('\n') : ''}`);
+    await refresh();
+    await loadAccounts();
+  } catch (e) { msg('未清理：'+e.message); }
 }
 async function deleteRow(target) { const id = typeof target === 'string' ? target : target.dataset.recordId; if (!confirm('从当前工作台移除此记录？飞书记录会在下次同步时恢复。')) return; try { msg(await api('/api/rows/delete',{record_id:id})); dirty=false; await refresh(); } catch(e) { msg(e.message); } }
 const accountLabels = {available:'已登录，可运行', busy:'运行中', checking:'正在验证登录', needs_login:'待登录', exhausted:'今日额度耗尽', disabled:'不可用', opening:'正在打开浏览器', error:'浏览器启动失败'};
@@ -568,10 +588,11 @@ function accountQuota(a) {
 function renderAccounts() {
   const markup = accounts.map(a => {
     const q = accountQuota(a), pending = accountPending.get(a.name);
+    const recovery = Number.isInteger(q?.pending_recovery) ? q.pending_recovery : 0;
     let label = accountLabels[a.status] || a.status;
     if (a.status === 'available' && a.enabled === false) label = '已停用';
     else if (a.status === 'available' && q?.remaining === 0) label = '已登录，今日次数已用完';
-    const quota = q ? `<p class="account-quota"><strong>今日已使用 ${q.used}/${q.limit}</strong> · 今日剩余 ${q.remaining} 次 · 预留 ${q.reserved} · 结果未知 ${q.unknown}</p><p class="muted">${esc(q.date || '')} · 按北京时间每日重置 · ${q.estimated === false ? '已按平台显示校准（非实时）' : '本地估算，平台余额待核验'}${q.remaining === 0 ? ' · 剩余为0，后续任务自动跳过' : ''}${q.unknown ? ' · 结果未知的次数暂占余额' : ''}${q.blocked_reason ? ' · '+esc(q.blocked_reason) : ''}</p>` : '<p class="muted account-quota">每日次数统计暂不可用</p>';
+    const quota = q ? `<p class="account-quota"><strong>今日已使用 ${q.used}/${q.limit}</strong> · 今日剩余 ${q.remaining} 次 · 预留 ${q.reserved} · 结果未知 ${q.unknown}${recovery ? ` · 历史未决 ${recovery}` : ''}</p><p class="muted">${esc(q.date || '')} · 按北京时间每日重置 · ${q.estimated === false ? '已按平台显示校准（非实时）' : '本地估算，平台余额待核验'}${q.remaining === 0 ? ' · 剩余为0，后续任务自动跳过' : ''}${q.unknown ? ' · 今日结果未知的次数暂占余额' : ''}${q.blocked_reason ? ' · '+esc(q.blocked_reason) : ''}</p>` : '<p class="muted account-quota">每日次数统计暂不可用</p>';
     const login = a.login_window_open ? `<p class="muted">登录窗口：${esc(a.login_note || accountLabels[a.login_status] || '等待登录验证')}</p>` : '';
     const name = esc(a.name), openingWindow = a.account_window_status === 'opening';
     const accountWindow = a.account_window_open || openingWindow;
@@ -641,6 +662,7 @@ async function loadVideos() {
   const d = await api('/api/videos');
   if (sequence !== videoFetchSequence) return;
   refreshRecovered('视频');
+  videoBatches = Array.isArray(d.batches) ? d.batches : null;
   videoRows = d.videos || [];
   for (const v of videoRows) videoApprovalJobs.delete(v.path);
   renderVideos();
@@ -653,7 +675,13 @@ function approvalText(job) {
   return (job.stage || (job.status === 'queued' ? '已审核通过，等待处理' : '正在处理')) + ' · ' + progress + '%';
 }
 function renderVideos() {
-  const markup = videoRows.map(v => {
+  const markup = videoBatches !== null ? videoBatches.map(batch => {
+    const pending = videoBatchPending.has(batch.id);
+    const id = esc(batch.id);
+    const sameMinute = videoBatches.filter(item => item.label === batch.label);
+    const number = sameMinute.length > 1 ? ' · 批次 ' + (sameMinute.indexOf(batch) + 1) : '';
+    return `<article class="card"><h2>${esc(batch.label)}</h2><p class="muted">${esc(batch.count)} 个视频${number}</p><div class="actions"><button class="btn gray" data-id="${id}" onclick="openVideoBatch(this)"${pending ? ' disabled' : ''}>打开文件夹</button><button class="btn red" data-id="${id}" onclick="deleteVideoBatch(this)"${pending ? ' disabled' : ''}>删除文件夹</button></div><p class="muted" role="status">${esc(videoBatchFeedback.get(batch.id) || '')}</p></article>`;
+  }).join('') || '暂无已下载视频' : videoRows.map(v => {
     const job = videoApprovalJobs.get(v.path) || v.postprocess;
     const submitting = videoApprovalPending.has(v.path);
     const active = submitting || job?.status === 'queued' || job?.status === 'running';
@@ -672,6 +700,37 @@ function renderVideos() {
     videoMarkup = markup;
   }
 }
+async function videoBatchAction(button, action) {
+  const id = button.dataset.id;
+  const batch = videoBatches?.find(item => item.id === id);
+  if (!batch || videoBatchPending.has(id)) return;
+  const deleting = action === 'delete';
+  if (deleting && !confirm(`永久删除 ${batch.label} 批次？\n\n该批次的成片、原始下载、校验文件和历史记录会一并删除，无法撤销。`)) return;
+  videoBatchPending.add(id);
+  videoBatchFeedback.set(id, deleting ? '正在删除批次…' : '正在打开文件夹…');
+  renderVideos();
+  try {
+    const result = await api('/api/video-batches/' + action, {id});
+    if (deleting) {
+      ++videoFetchSequence;
+      videoBatches = videoBatches.filter(item => item.id !== id);
+      videoBatchFeedback.delete(id);
+      refresh();
+    } else {
+      videoBatchFeedback.set(id, result.message);
+    }
+    msg(result.message);
+  } catch (e) {
+    const message = (deleting ? '删除失败：' : '打开失败：') + e.message;
+    videoBatchFeedback.set(id, message);
+    msg(message);
+  } finally {
+    videoBatchPending.delete(id);
+    renderVideos();
+  }
+}
+async function openVideoBatch(button) { await videoBatchAction(button, 'open'); }
+async function deleteVideoBatch(button) { await videoBatchAction(button, 'delete'); }
 async function approveVideo(button) {
   const path = button.dataset.path;
   if (videoApprovalPending.has(path) || videoDeletePending.has(path)) return;

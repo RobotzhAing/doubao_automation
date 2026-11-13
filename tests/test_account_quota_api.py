@@ -48,7 +48,7 @@ class AccountQuotaApiTests(unittest.TestCase):
         self.assertFalse(account['enabled'])
         self.assertEqual(account['quota']['limit'],4)
         self.assertEqual(account['quota']['timezone'],'Asia/Shanghai')
-        for field in ('used','reserved','unknown','remaining','estimated','date','blocked_reason'):
+        for field in ('used','reserved','unknown','pending_recovery','remaining','estimated','date','blocked_reason'):
             self.assertIn(field,account['quota'])
 
     def test_login_window_is_separate_from_exhausted_identity(self):

@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from playwright.sync_api import sync_playwright
 
@@ -31,7 +32,7 @@ class GeminiUploadTests(unittest.TestCase):
         cls.playwright.stop()
 
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix='gemini_upload_test_')
+        self.temp = tempfile.TemporaryDirectory(prefix='gemini_upload_test_',dir='/private/tmp')
         self.addCleanup(self.temp.cleanup)
         self.video = Path(self.temp.name) / 'synthetic.mp4'
         self.video.write_bytes(b'local fixture; never sent to a server')
@@ -74,6 +75,129 @@ class GeminiUploadTests(unittest.TestCase):
         self.assertEqual(self.page.locator('input[accept=".pdf,.txt"]').evaluate('(e)=>e.files.length'), 0)
         self.assertEqual(self.page.locator('#media').evaluate('(e)=>e.files.length'), 1)
         self.assertEqual(self.page.locator('user-query').count(), 0)
+
+    def delayed_menu_fixture(self, delay=1800, *, opened=False, chooser_delay=0):
+        self.cfg['gemini']['upload_control_timeout_seconds'] = 5
+        self.fixture('<button aria-label="上传和工具" aria-expanded="false">Add</button>'
+                     '<div id="menu"></div><span id="attachments"></span>',
+                     '''window.openClicks=0;window.menuClicks=0;window.uploads=0;
+                     window.showMenu=()=>{
+                       document.querySelector('#menu').innerHTML='<button role="menuitem">上传文件</button>';
+                       document.querySelector('[role="menuitem"]').onclick=()=>{
+                         window.menuClicks++;
+                         setTimeout(()=>{
+                           const input=document.createElement('input');
+                           input.type='file';input.accept='video/*';input.id='media';
+                           input.onchange=()=>{window.uploads++;
+                             document.querySelector('#attachments').innerHTML=window.tile};
+                           document.querySelector('[data-node-type]').append(input);
+                           input.click();
+                         },''' + str(chooser_delay) + ''');
+                       };
+                     };
+                     document.querySelector('button').onclick=function(){
+                       window.openClicks++;
+                       if(this.getAttribute('aria-expanded')==='true'){
+                         this.setAttribute('aria-expanded','false');
+                         document.querySelector('#menu').replaceChildren();return;
+                       }
+                       this.setAttribute('aria-expanded','true');
+                       setTimeout(window.showMenu,''' + str(delay) + ''');
+                     };''')
+        self.page.evaluate('(tile)=>window.tile=tile', self._video_preview(self.video.name))
+        if opened:
+            self.page.evaluate("document.querySelector('button').setAttribute('aria-expanded','true');window.showMenu()")
+
+    def test_slow_upload_menu_is_polled_without_toggling_it_closed(self):
+        self.delayed_menu_fixture()
+        self.agent.upload_files([self.video])
+        self.assertEqual(self.page.evaluate('[openClicks,menuClicks,uploads]'), [1,1,1])
+        self.assertEqual(self.page.locator('user-query').count(), 0)
+
+    def test_already_open_menu_is_used_without_clicking_opener(self):
+        self.delayed_menu_fixture(opened=True)
+        self.agent.upload_files([self.video])
+        self.assertEqual(self.page.evaluate('[openClicks,menuClicks,uploads]'), [0,1,1])
+
+    def test_delayed_input_after_opener_is_not_reported_missing(self):
+        self.cfg['gemini']['upload_control_timeout_seconds'] = 4
+        self.fixture('<button aria-label="上传和工具">Add</button><span id="attachments"></span>',
+                     'window.clicks=0;document.querySelector("button").onclick=()=>{window.clicks++;'
+                     'setTimeout(()=>document.querySelector("[data-node-type]").insertAdjacentHTML("beforeend",' +
+                     json.dumps(self.media_input()) + '),1800)}')
+        self.agent.upload_files([self.video])
+        self.assertEqual(self.page.evaluate('clicks'), 1)
+        self.assertEqual(self.page.locator('#media').evaluate('(e)=>e.files.length'), 1)
+
+    def test_pre_hydration_click_retries_only_explicitly_collapsed_opener(self):
+        self.delayed_menu_fixture(delay=0)
+        self.page.evaluate('''()=>{
+          const button=document.querySelector('button');const handler=button.onclick;
+          button.onclick=()=>window.openClicks++;
+          setTimeout(()=>button.onclick=handler,1700);
+        }''')
+        self.agent.upload_files([self.video])
+        self.assertGreater(self.page.evaluate('openClicks'), 1)
+        self.assertEqual(self.page.evaluate('[menuClicks,uploads]'), [1,1])
+
+    def test_slow_chooser_after_menu_click_uploads_only_once(self):
+        self.delayed_menu_fixture(delay=0, chooser_delay=1800)
+        self.agent.upload_files([self.video])
+        self.assertEqual(self.page.evaluate('[openClicks,menuClicks,uploads]'), [1,1,1])
+
+    def test_missing_menu_waits_until_control_deadline_without_reclicking(self):
+        self.cfg['gemini']['upload_control_timeout_seconds'] = .7
+        self.fixture('<button aria-label="上传和工具" onclick="window.clicks++">Add</button>',
+                     'window.clicks=0;setTimeout(()=>window.deadlineMarker=true,450)')
+        with self.assertRaisesRegex(GeminiError, '无法找到'):
+            self.agent.upload_files([self.video])
+        self.assertTrue(self.page.evaluate('window.deadlineMarker'))
+        self.assertEqual(self.page.evaluate('clicks'), 1)
+        self.assertEqual(self.page.locator('user-query').count(), 0)
+
+    def test_file_chooser_listener_is_removed_on_success_and_timeout(self):
+        for success in (True, False):
+            with self.subTest(success=success):
+                self.cfg['gemini']['upload_control_timeout_seconds'] = .3
+                self.fixture(self.media_input() + '<span id="attachments"></span>' if success else '')
+                with patch.object(self.page, 'on', wraps=self.page.on) as listen, \
+                        patch.object(self.page, 'remove_listener', wraps=self.page.remove_listener) as remove:
+                    if success:
+                        self.agent.upload_files([self.video])
+                    else:
+                        with self.assertRaises(GeminiError):
+                            self.agent.upload_files([self.video])
+                    remove.assert_called_once_with('filechooser', listen.call_args.args[1])
+
+    def test_ambiguous_input_failure_never_tries_a_second_input(self):
+        self.fixture(self.media_input() + '<span id="attachments"></span>')
+        with patch.object(self.agent, '_set_upload_input', side_effect=RuntimeError('partial upload')) as upload:
+            with self.assertRaisesRegex(RuntimeError, 'partial upload'):
+                self.agent.upload_files([self.video])
+            upload.assert_called_once()
+
+    def test_disabled_menu_item_is_waited_for_without_reopening(self):
+        self.delayed_menu_fixture(opened=True)
+        self.page.evaluate('''()=>{
+          const item=document.querySelector('[role="menuitem"]');item.disabled=true;
+          setTimeout(()=>item.disabled=false,1800);
+        }''')
+        self.agent.upload_files([self.video])
+        self.assertEqual(self.page.evaluate('[openClicks,menuClicks,uploads]'), [0,1,1])
+
+    def test_same_chat_retry_uses_live_chooser_before_stale_document_input(self):
+        self.delayed_menu_fixture()
+        self.page.locator('[data-node-type]').evaluate('''root=>{
+          const stale=document.createElement('input');stale.id='stale';stale.type='file';
+          stale.accept='video/*';stale.onchange=()=>window.staleUploads=(stale.files||[]).length;
+          document.body.append(stale);
+        }''')
+
+        self.agent.upload_files([self.video],prefer_file_chooser=True)
+
+        self.assertEqual(self.page.locator('#stale').evaluate('(e)=>e.files.length'),0)
+        self.assertEqual(self.page.locator('#media').evaluate('(e)=>e.files.length'),1)
+        self.assertEqual(self.page.evaluate('[openClicks,menuClicks,uploads]'),[1,1,1])
 
     def test_direct_input_ignores_document_uploader_even_when_it_is_first(self):
         self.fixture('<input type="file" accept=".pdf">' + self.media_input() + '<span id="attachments"></span>')

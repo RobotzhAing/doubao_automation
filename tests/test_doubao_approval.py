@@ -9,7 +9,7 @@ from unittest.mock import Mock
 
 from playwright.sync_api import sync_playwright
 
-from doubao_automation.doubao_agent import DoubaoAgent, NeedsUserAction
+from doubao_automation.doubao_agent import DoubaoAgent, GenerationFailed, NeedsUserAction
 from doubao_automation.paths import use_workspace_temp
 
 
@@ -120,15 +120,53 @@ class ApprovalTests(unittest.TestCase):
             self.agent.send()
         self.assert_no_approval_actions()
 
-    def test_send_trigger_is_not_logged_as_platform_acceptance(self):
+    def test_send_button_without_user_message_is_not_reported_as_sent(self):
+        self.agent.dcfg['send_confirmation_timeout_seconds'] = .1
         self.fixture('<button id="send">Send</button>')
         self.agent.type_text = lambda text: self.page.locator('#editor').fill(text)
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
+            with self.assertRaisesRegex(GenerationFailed, '草稿仍在输入框'):
+                self.agent.type_and_send('local fixture prompt')
+        self.assertNotIn('已确认本条消息进入对话', output.getvalue())
+        self.assertEqual(self.page.locator('#editor').input_value(), 'local fixture prompt')
+
+    def test_send_waits_until_exact_user_message_is_visible(self):
+        self.agent.dcfg['send_confirmation_timeout_seconds'] = 1
+        self.fixture('<button id="send">Send</button>',
+            'document.querySelector("#send").onclick=()=>{'
+            'const editor=document.querySelector("#editor");'
+            'const message=document.createElement("div");'
+            'message.setAttribute("data-testid","send_message");'
+            'message.textContent=editor.value;document.body.append(message);editor.value=""}')
+        self.agent.type_text = lambda text: self.page.locator('#editor').fill(text)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
             self.agent.type_and_send('local fixture prompt')
-        self.assertIn('已触发发送', output.getvalue())
-        self.assertNotIn('提示词已发送', output.getvalue())
-        self.assertNotIn('平台已接受', output.getvalue())
+        self.assertIn('已确认本条消息进入对话', output.getvalue())
+
+    def test_stale_configured_input_selector_uses_visible_semantic_fallback(self):
+        self.fixture()
+        self.agent.sel['input_box'] = '#stale-editor'
+        self.assertTrue(self.agent._chat_ready())
+        self.agent.type_text('fallback fixture text')
+        self.assertEqual(self.page.locator('#editor').input_value(), 'fallback fixture text')
+
+    def test_semantic_doubao_send_button_is_discovered_without_config(self):
+        self.agent.sel['send_button'] = []
+        self.agent.dcfg['send_confirmation_timeout_seconds'] = 1
+        self.fixture('<button aria-label="发送">➤</button>',
+            'document.querySelector("button[aria-label=发送]").onclick=()=>{'
+            'const editor=document.querySelector("#editor");'
+            'const message=document.createElement("div");'
+            'message.setAttribute("data-testid","send_message");'
+            'message.textContent=editor.value;document.body.append(message);editor.value=""}')
+        self.agent.type_text = lambda text: self.page.locator('#editor').fill(text)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.agent.type_and_send('local fixture prompt')
+        self.assertIn('按钮发送=True', output.getvalue())
+        self.assertIn('已确认本条消息进入对话', output.getvalue())
 
     def test_batch_approval_after_send_returns_strict_unsubmitted_evidence(self):
         self.fixture('<button id="send">Send</button>',

@@ -115,6 +115,61 @@ class AssetOwnershipTests(unittest.TestCase):
         self.assertTrue(assets[0]['ownership_verified'])
         self.assertEqual(self.agent._assistant_text(), 'office ready')
 
+    def test_collapsed_long_user_turn_is_expanded_to_find_tail_marker(self):
+        collapsed = ('<section data-message-id="owner"><div data-testid="send_message" '
+                     'data-message-role="user"><div data-testid="message_text_content">'
+                     'OFFICE TASK</div><button data-testid="message_expand_all_button">展开全文</button>'
+                     '</div></section>')
+        self.page.set_content(collapsed + assistant('office-answer', video='https://fixture.invalid/office.mp4'))
+        self.page.locator('[data-testid="message_expand_all_button"]').evaluate(
+            "button => button.addEventListener('click', () => { "
+            "button.parentElement.querySelector('[data-testid=message_text_content]').textContent = "
+            "'OFFICE TASK\\n【任务 marker-unique】'; button.remove(); })")
+
+        assets = self.agent._batch_assets()
+
+        self.assertEqual([a['card_message_id'] for a in assets], ['office-answer'])
+        self.assertTrue(self.agent._batch_scope_state['owner_found'])
+        self.assertEqual(self.agent._batch_scope_state['user_message_id'], 'owner')
+
+    def test_doubao_attachment_count_rendering_still_matches_complete_prompt(self):
+        prefix = '完整提示' + ('场景说明' * 40)
+        prompt = prefix + '\nreference.webp\n+ 1\n末尾内容'
+        marker = '【自动化任务标记：request-fixture】'
+        rendered = '生成视频：' + prefix + '\nreference.webp1\n末尾内容\n' + marker + '，9:16，15s，720p展开全部'
+        self.agent._batch_ownership = {'prompt': prompt, 'marker': marker, 'control_texts': []}
+        collapsed = ('<section data-message-id="owner"><div data-testid="send_message" '
+                     'data-message-role="user"><div data-testid="message_text_content">'
+                     '生成视频：' + prefix[:96] + '</div><button data-testid="message_expand_all_button">展开全部</button>'
+                     '</div></section>')
+        self.page.set_content(collapsed + assistant('owned-answer', video='https://fixture.invalid/owned.mp4'))
+        self.page.locator('[data-testid="message_expand_all_button"]').evaluate(
+            "(button, text) => button.addEventListener('click', () => { "
+            "button.parentElement.querySelector('[data-testid=message_text_content]').textContent = text; "
+            "button.remove(); })", rendered)
+
+        assets = self.agent._batch_assets()
+
+        self.assertTrue(self.agent._batch_scope_state['owner_found'], self.agent._batch_scope_state)
+        self.assertEqual([asset['card_message_id'] for asset in assets], ['owned-answer'])
+        self.assertEqual(self.agent._batch_scope_state['user_message_id'], 'owner')
+        self.assertFalse(self.agent.sent)
+
+    def test_hidden_tail_marker_in_dom_is_matched_without_visible_inner_text(self):
+        collapsed = ('<section data-message-id="owner"><div data-testid="send_message" '
+                     'data-message-role="user"><div data-testid="message_text_content">'
+                     'OFFICE TASK<span style="display:none">\\n【任务 marker-unique】</span>'
+                     '</div><div data-testid="message_expand_all_button">展开全文</div>'
+                     '</div></section>')
+        self.page.set_content(collapsed + assistant('office-answer', video='https://fixture.invalid/office.mp4'))
+        visible = self.page.locator('[data-testid="message_text_content"]').inner_text()
+        self.assertNotIn('marker-unique', visible)
+
+        assets = self.agent._batch_assets()
+
+        self.assertEqual([a['card_message_id'] for a in assets], ['office-answer'])
+        self.assertTrue(self.agent._batch_scope_state['route_marker_found'])
+
     def test_role_only_owner_is_found_alongside_older_canonical_messages(self):
         own = self.own_user().replace('data-testid="send_message" ', '')
         answer = assistant('role-answer').replace('data-testid="receive_message" ', '')
@@ -168,6 +223,68 @@ class AssetOwnershipTests(unittest.TestCase):
         spec['marker'] = 'changed marker'
         self.agent._batch_ownership = self.agent._ownership_spec([{'id':'office#0'}], {}, {'ownership':spec}, True)
         self.assertEqual(self.agent._batch_assets(), [], 'proof is bound to the exact original marker')
+
+    def test_operator_confirmed_resume_anchors_only_after_explicit_confirmation_request(self):
+        task = {'id': 'office#0'}
+        spec = {'prompt': 'OFFICE TASK', 'marker': '【任务 marker-unique】',
+                'chat_path': '/chat/12340000000001', 'control_texts': []}
+        spec['original_anchor_proof'] = self.agent._original_anchor_proof(spec, spec['chat_path'])
+        baseline = {'ownership': spec, 'ownership_acknowledged': True,
+                    'controls': [{'phase': 'operator_approved_resume', 'task_ids': [task['id']]}]}
+        self.agent._batch_ownership = self.agent._ownership_spec([task], {}, baseline, True)
+        self.page.set_content(
+            assistant('confirm-request', text='确认后我再开始生成视频。') +
+            user('operator-confirm', '确认，开始生成这条视频。') +
+            assistant('owned-result', text='你的视频生成好了。', video='https://fixture.invalid/confirmed.mp4'))
+
+        assets = self.agent._batch_assets()
+
+        self.assertEqual([asset['card_message_id'] for asset in assets], ['owned-result'])
+        self.assertEqual(self.agent._batch_scope_state['anchor_kind'], 'operator_confirmed')
+        self.assertEqual(self.agent._batch_scope_state['operator_confirmation_text'], '确认，开始生成这条视频。')
+        self.assertTrue(self.agent._batch_scope_state['latest_control_mounted'])
+        self.assertEqual(self.agent._assistant_text(), '你的视频生成好了。')
+
+    def test_operator_confirmation_is_allowed_after_the_original_prompt_anchor(self):
+        task = {'id': 'office#0'}
+        spec = {'prompt': 'OFFICE TASK', 'marker': '【任务 marker-unique】',
+                'chat_path': '/chat/12340000000001', 'control_texts': []}
+        spec['original_anchor_proof'] = self.agent._original_anchor_proof(spec, spec['chat_path'])
+        baseline = {'ownership': spec, 'ownership_acknowledged': True,
+                    'controls': [{'phase': 'operator_approved_resume', 'task_ids': [task['id']]}]}
+        self.agent._batch_ownership = self.agent._ownership_spec([task], {}, baseline, True)
+        self.page.set_content(
+            user('original-task', 'OFFICE TASK\n【任务 marker-unique】') +
+            assistant('confirm-request', card=False, text='确认后我再开始生成视频。') +
+            user('operator-confirm', '确认，开始生成这条视频。') +
+            assistant('owned-result', text='你的视频生成好了。', video='https://fixture.invalid/confirmed.mp4'))
+
+        assets = self.agent._batch_assets()
+
+        self.assertEqual([asset['card_message_id'] for asset in assets], ['owned-result'])
+        self.assertEqual(self.agent._batch_scope_state['anchor_kind'], 'original')
+        self.assertEqual(self.agent._batch_scope_state['operator_confirmation_text'], '确认，开始生成这条视频。')
+        self.assertEqual(self.agent._assistant_text(), '你的视频生成好了。')
+
+    def test_operator_confirmation_anchor_requires_approval_and_immediate_prompt(self):
+        task = {'id': 'office#0'}
+        spec = {'prompt': 'OFFICE TASK', 'marker': '【任务 marker-unique】',
+                'chat_path': '/chat/12340000000001', 'control_texts': []}
+        spec['original_anchor_proof'] = self.agent._original_anchor_proof(spec, spec['chat_path'])
+        unapproved = {'ownership': spec, 'ownership_acknowledged': True, 'controls': []}
+        self.agent._batch_ownership = self.agent._ownership_spec([task], {}, unapproved, True)
+        self.page.set_content(assistant('unrelated', text='今天的内容已整理完毕。') +
+                              user('operator-confirm', '确认，开始生成这条视频。') +
+                              assistant('unowned-result', video='https://fixture.invalid/unowned.mp4'))
+        self.assertEqual(self.agent._batch_assets(), [])
+
+        approved = {'ownership': spec, 'ownership_acknowledged': True,
+                    'controls': [{'phase': 'operator_approved_resume', 'task_ids': [task['id']]}]}
+        self.agent._batch_ownership = self.agent._ownership_spec([task], {}, approved, True)
+        self.page.set_content(assistant('unrelated', text='今天的内容已整理完毕。') +
+                              user('operator-confirm', '确认，开始生成这条视频。') +
+                              assistant('unowned-result', video='https://fixture.invalid/unowned.mp4'))
+        self.assertEqual(self.agent._batch_assets(), [])
         self.control_recovery_spec(task_count=2)
         self.assertEqual(self.agent._batch_assets(), [], 'multi-output slot ordering is ambiguous')
         self.control_recovery_spec()
@@ -532,7 +649,24 @@ class AssetOwnershipTests(unittest.TestCase):
                                        'baseline': {'ownership': {'user_message_id': 'owner', 'prompt': 'OFFICE TASK'}}},
                                       lambda *args: None, lambda *args: None)
         self.assertEqual(result['error_kind'], 'needs_user')
-        self.assertIn('恢复模式不会发送消息', result['error'])
+        self.assertIn('缺少一次性操作员恢复批准', result['error'])
+        self.assertFalse(self.agent.sent)
+        self.assertFalse(result['videos'])
+
+    def test_resume_ignores_preconfirmation_reply_until_registered_control_is_mounted(self):
+        target = 'https://www.doubao.com/chat/12340000000008'
+        control = '确认后仅生成本次办公室视频'
+        markup = user('owner', 'OFFICE TASK') + assistant('confirm-one', card=False, text='确认后我再开始生成视频。')
+        self.page.route(target, lambda route: route.fulfill(content_type='text/html; charset=utf-8', body=markup))
+        task = dict(id='office#0', seg_index=0, seg_total=1, target_seconds=15,
+                    est_seconds=15, start_seconds=0, end_seconds=15, prompt='OFFICE TASK')
+        result = self.agent.run_batch([task], [], {'office#0': Path(self.temp.name) / 'resume-confirmation.mp4'},
+                                      {'resume_only': True, 'chat_url': target, 'total_seconds': 15,
+                                       'baseline': {'ownership': {'user_message_id': 'owner', 'prompt': 'OFFICE TASK',
+                                                                  'control_texts': [control]}}},
+                                      lambda *args: None, lambda *args: None)
+        self.assertEqual(result['error_kind'], 'timeout')
+        self.assertNotIn('仍等待平台确认', result['error'])
         self.assertFalse(self.agent.sent)
         self.assertFalse(result['videos'])
 

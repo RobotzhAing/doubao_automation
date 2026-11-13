@@ -51,11 +51,20 @@ class RuntimeSelectionTests(unittest.TestCase):
         self.assertIn('一键启动入口', result['error'])
         self.assertIn('-m playwright install chromium', result['error'])
 
-    def test_windows_default_still_uses_chrome_channel(self):
-        result = self.select({}, set(), platform='win32')
-        self.assertTrue(result['available'])
-        self.assertEqual(result['channel'], 'chrome')
-        self.assertFalse(result['explicit'])
+    def test_windows_default_uses_installed_chrome_or_managed_browser(self):
+        chrome_root = Path('/fixture/programs')
+        chrome = chrome_root / 'Google/Chrome/Application/chrome.exe'
+        with patch.dict(browser_runtime.os.environ, {'PROGRAMFILES': str(chrome_root)}, clear=True):
+            self.assertEqual(self.select({}, {chrome}, platform='win32')['channel'], 'chrome')
+            missing = self.select({}, set(), platform='win32')
+            self.assertFalse(missing['available'])
+            self.assertTrue(missing['install_managed'])
+            installed = self.select({}, {self.managed}, platform='win32')
+            self.assertTrue(installed['available'])
+            self.assertIsNone(installed['channel'])
+            explicit = self.select({'browser': {'channel': 'chrome'}}, {self.managed}, platform='win32')
+            self.assertFalse(explicit['available'])
+            self.assertFalse(explicit['install_managed'])
 
 
 class BrowserLaunchTests(unittest.TestCase):

@@ -15,7 +15,7 @@ function element(selector) {
   return elements.get(selector);
 }
 const name = "中文's <账号>";
-const quota = {date:'2026-10-31',timezone:'Asia/Shanghai',limit:4,used:1,reserved:1,unknown:1,remaining:1,estimated:true,blocked_reason:''};
+const quota = {date:'2026-10-31',timezone:'Asia/Shanghai',limit:4,used:1,reserved:1,unknown:1,pending_recovery:1,remaining:1,estimated:true,blocked_reason:'历史请求尚未核对'};
 let rows = [{name,enabled:true,status:'needs_login',note:'请登录 <safe>',quota:structuredClone(quota)}];
 const requests = [], confirmations = [], delayedLists = [];
 let delayList = false, actionGate, rejectAction = false, confirmAnswer = false;
@@ -47,6 +47,8 @@ function posts(){return requests.filter(r=>r.options.method==='POST');}
   assert.match(html(),/配置已保存 · 待登录/,'quota cannot override login identity');
   assert.match(html(),/今日已使用 1\/4/);
   assert.match(html(),/今日剩余 1 次 · 预留 1 · 结果未知 1/);
+  assert.match(html(),/历史未决 1/);
+  assert.match(html(),/历史请求尚未核对/);
   assert.match(html(),/本地估算，平台余额待核验/);
   assert.match(html(),/按北京时间每日重置/);
   assert.match(html(),/结果未知的次数暂占余额/);

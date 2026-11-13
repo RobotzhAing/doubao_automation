@@ -35,6 +35,12 @@ class AccountManager:
         return acc
 
     def _normalize(self,acc):
+        # Older runners permanently disabled an account after any browser
+        # startup exception. A transient composer-readiness failure is
+        # retryable, and the account remains enabled in the user's config.
+        if (acc.get('status')==DISABLED
+                and '找不到可用对话输入框' in str(acc.get('note',''))):
+            acc.update(status=AVAILABLE,note='旧版启动异常已恢复，可安全重试',date='')
         if acc.get('status')==EXHAUSTED and acc.get('date')!=self._today():
             acc.update(status=AVAILABLE,note='',date='')
         if (acc.get('status')==EXHAUSTED and acc.get('date')==self._today()
@@ -53,22 +59,30 @@ class AccountManager:
     def _public(self,acc):
         today=self._today();day=acc.get('quota_days',{}).get(today,{})
         limit=int(day.get('limit',self.daily_limit))
-        used=int(day.get('baseline_used',0))+sum(e.get('state')=='charged' for d,_,e in self._entries(acc) if d==today)
-        reserved=sum(e.get('state')=='reserved' for _,_,e in self._entries(acc))
+        entries=list(self._entries(acc))
+        today_entries=[entry for entry_day,_,entry in entries if entry_day==today]
+        used=int(day.get('baseline_used',0))+sum(e.get('state')=='charged' for e in today_entries)
+        reserved=sum(e.get('state')=='reserved' for e in today_entries)
         awaiting_approval=sum(e.get('state')=='reserved' and e.get('awaiting_user_approval') is True
-                              for _,_,e in self._entries(acc))
-        unknown=sum(e.get('state') in ('submitted','unknown') for _,_,e in self._entries(acc))
+                              for e in today_entries)
+        unknown=sum(e.get('state') in ('submitted','unknown') for e in today_entries)
+        # Old requests still block new work until reconciled, but their usage
+        # belongs to the day they were submitted and must not reduce today's quota.
+        pending_recovery=sum(entry_day!=today and e.get('state') in ('reserved','submitted','unknown')
+                             for entry_day,_,e in entries)
         remaining=max(0,limit-used-reserved-unknown);reason='';status=acc.get('status',AVAILABLE)
         if status==DISABLED:reason='账号已禁用'
         elif status==NEEDS_LOGIN:reason='需要重新登录'
         elif day.get('platform_exhausted') or (status==EXHAUSTED and acc.get('date')==today):
             remaining,reason=0,'平台提示今日额度已耗尽'
-        elif unknown:reason='已提交产物待核对；仅可恢复原请求'
         elif awaiting_approval:reason='等待素材授权确认；保留原请求预留，尚未确认提交'
+        elif unknown:reason='已提交产物待核对；仅可恢复原请求'
+        elif pending_recovery:reason='历史请求尚未核对；仅可恢复原请求'
         elif remaining==0:reason='今日额度已用完或已预留'
         return dict(date=today,limit=limit,used=used,reserved=reserved,unknown=unknown,
                     awaiting_approval=awaiting_approval,
-                    remaining=remaining,estimated=bool(day.get('estimated',True)),blocked_reason=reason)
+                    pending_recovery=pending_recovery,remaining=remaining,
+                    estimated=bool(day.get('estimated',True)),blocked_reason=reason)
 
     def quota(self,name):return self._public(self.store.snapshot().get('accounts',{}).get(name,{}))
 
@@ -105,6 +119,8 @@ class AccountManager:
             existing=requests.get(request_id)
             if existing:
                 if existing['task_ids']!=task_ids:raise ValueError('同一请求不能更换视频任务')
+                if existing.get('resolution')=='operator_archived_unknown':
+                    raise ValueError('已归档的未知请求不能复用，请创建新的任务编号')
                 if any(e.get('state') in ('cancelled','rejected') for _,_,e in self._entries(acc) if e.get('request_id')==request_id):
                     raise ValueError('已取消的请求不能复用，请使用新的请求编号')
                 return deepcopy(existing)
@@ -113,6 +129,7 @@ class AccountManager:
                 if any(e.get('task_id') in task_ids and e.get('state') not in ('cancelled','rejected') for _,_,e in self._entries(other)):
                     raise ValueError('视频任务已有额度记录，应恢复原请求而不是再次提交')
             quota=self._public(acc)
+            if quota['pending_recovery']:raise ValueError('账号有未决请求，仅可恢复原请求')
             if quota['unknown']:raise ValueError('账号有未决提交，仅可恢复原请求')
             if quota['awaiting_approval']:raise ValueError('账号有等待授权的原请求，不能创建新请求')
             if quota['remaining']<len(task_ids):raise ValueError('账号剩余额度不足，不能部分预留此批次')
@@ -129,6 +146,58 @@ class AccountManager:
         if record:record['entries']={e['task_id']:deepcopy(e) for _,_,e in self._entries(acc) if e.get('request_id')==request_id}
         return record
 
+    def archive_unknown_requests(self,bindings,note):
+        """Retire exact, prior-day submitted requests while preserving their audit ledger."""
+        if not isinstance(bindings,(list,tuple)) or not bindings:
+            raise ValueError('必须指定要归档的原请求清单')
+        today=self._today()
+        archived_at=self.clock()
+        if archived_at.tzinfo is None:archived_at=archived_at.replace(tzinfo=timezone.utc)
+        archived_at=archived_at.astimezone(CHINA).isoformat(timespec='seconds')
+        normalized=[];seen=set()
+        for item in bindings:
+            if not isinstance(item,dict):raise ValueError('原请求归档清单格式无效')
+            name=item.get('account');request_id=item.get('request_id');task_ids=item.get('task_ids')
+            if (not isinstance(name,str) or not name or not isinstance(request_id,str) or not request_id
+                    or not isinstance(task_ids,list) or not task_ids
+                    or any(not isinstance(tid,str) or not tid for tid in task_ids)
+                    or len(set(task_ids))!=len(task_ids) or (name,request_id) in seen):
+                raise ValueError('原请求归档清单包含无效或重复条目')
+            seen.add((name,request_id));normalized.append((name,request_id,list(task_ids)))
+        with self.store.txn() as data:
+            prepared=[]
+            for name,request_id,task_ids in normalized:
+                acc=self._account(data,name)
+                request=acc.get('quota_requests',{}).get(request_id)
+                if not request or request.get('task_ids')!=task_ids:
+                    raise ValueError(f'账号 {name} 的原请求或任务清单已变化')
+                entries=[(day,entry) for day,_,entry in self._entries(acc)
+                         if entry.get('request_id')==request_id]
+                if (request.get('resolution')=='operator_archived_unknown'
+                        and entries and all(entry.get('state')=='archived_unknown' for _,entry in entries)):
+                    prepared.append((name,request_id,acc,request,entries,True))
+                    continue
+                if request.get('submitted') is not True or len(entries)!=len(task_ids):
+                    raise ValueError(f'账号 {name} 的请求不是完整的已提交任务，不能归档')
+                if any(day>=today for day,_ in entries):
+                    raise ValueError('当天或未来日期的未决请求不能解除额度预留')
+                if any(entry.get('task_id') not in task_ids
+                       or entry.get('state') not in ('submitted','unknown')
+                       or entry.get('remote_ref') for _,entry in entries):
+                    raise ValueError(f'账号 {name} 的请求包含已生成、已完成或非未知任务，不能归档')
+                prepared.append((name,request_id,acc,request,entries,False))
+            for name,request_id,acc,request,entries,already_archived in prepared:
+                if already_archived:continue
+                for _,entry in entries:
+                    entry.update(state='archived_unknown',pre_archive_state=entry.get('state'),
+                                 pre_archive_note=entry.get('note',''),archived_at=archived_at,
+                                 archive_note=str(note or 'operator archived stale request')[:500])
+                request.update(resolution='operator_archived_unknown',archived_at=archived_at,
+                               archive_note=str(note or 'operator archived stale request')[:500])
+                if acc.get('status')==BUSY:acc.update(status=AVAILABLE,date='')
+        return dict(archived=[dict(account=name,request_id=rid,task_ids=task_ids)
+                              for name,rid,task_ids in normalized],archived_at=archived_at)
+
     def find_task(self,task_id,include_inactive=False):
         inactive=None
         for name,acc in self.store.snapshot().get('accounts',{}).items():
@@ -136,7 +205,7 @@ class AccountManager:
                 if entry.get('task_id')==task_id:
                     record=deepcopy(acc.get('quota_requests',{}).get(entry['request_id'],{}))
                     result=dict(account=name,date=day,**deepcopy(entry),request=record)
-                    if entry.get('state') not in ('cancelled','rejected'):return result
+                    if entry.get('state') not in ('cancelled','rejected','archived_unknown'):return result
                     inactive=result
         return inactive if include_inactive else None
 
@@ -144,17 +213,21 @@ class AccountManager:
         with self.store.txn() as data:
             acc=self._account(data,name);request=acc.get('quota_requests',{}).get(request_id)
             if not request:raise ValueError('没有此请求的额度预留')
+            if request.get('resolution')=='operator_archived_unknown':
+                raise ValueError('已归档的未知请求不能再次提交')
             if not request.get('submitted'):
                 quota=self._public(acc)
+                old_reservations=[(day,key,entry) for day,key,entry in self._entries(acc)
+                                  if entry.get('request_id')==request_id and entry.get('state')=='reserved'
+                                  and day!=self._today()]
                 if (self._day(acc).get('platform_exhausted')
-                        or quota['used']+quota['reserved']+quota['unknown']>quota['limit']):
+                        or quota['used']+quota['reserved']+quota['unknown']+len(old_reservations)>quota['limit']):
                     raise ValueError('平台余额已变化，本批次不能发送，请释放后缩小批次')
                 # A reserved-but-unsent request is charged on its actual submission day.
-                if request['date']!=self._today():
+                if old_reservations:
                     moved=[]
-                    for day,key,entry in list(self._entries(acc)):
-                        if entry.get('request_id')==request_id and entry.get('state')=='reserved':
-                            moved.append((key,entry));del acc['quota_days'][day]['entries'][key]
+                    for day,key,entry in old_reservations:
+                        moved.append((key,entry));del acc['quota_days'][day]['entries'][key]
                     self._day(acc)['entries'].update(moved)
                     request['date']=self._today()
             request['submitted']=True
@@ -171,7 +244,8 @@ class AccountManager:
         with self.store.txn() as data:
             acc=self._account(data,name)
             matching=[e for _,_,e in self._entries(acc) if e.get('task_id')==task_id
-                      and (not request_id or e.get('request_id')==request_id) and e.get('state') not in ('cancelled','rejected')]
+                      and (not request_id or e.get('request_id')==request_id)
+                      and e.get('state') not in ('cancelled','rejected','archived_unknown')]
             if len(matching)!=1:raise ValueError('无法唯一确定已生成视频的额度记录')
             matching[0]['state']='charged'
             matching[0].pop('awaiting_user_approval',None)
@@ -264,6 +338,37 @@ class AccountManager:
             request['rejected_task_ids']=sorted(set(request.get('rejected_task_ids',[]))|set(released))
         return released
 
+    def release_not_generated(self,name,request_id,task_ids,evidence):
+        """Release submitted slots only when the latest assistant proves no video was rendered."""
+        if (not isinstance(evidence,dict) or evidence.get('kind')!='generation_unavailable'
+                or evidence.get('definitive') is not True or evidence.get('active') is not False
+                or evidence.get('source')!='latest_assistant'
+                or evidence.get('video_asset_found') is not False):
+            raise ValueError('只有最新回复明确表示未执行渲染且无视频产物时才能释放额度预留')
+        if not isinstance(task_ids,(list,tuple,set)) or not task_ids or any(not isinstance(tid,str) or not tid for tid in task_ids):
+            raise ValueError('必须指定确切的未生成任务编号')
+        selected=set(task_ids);released=[]
+        with self.store.txn() as data:
+            acc=self._account(data,name)
+            request=acc.get('quota_requests',{}).get(request_id)
+            if not request:raise ValueError('没有此请求的额度记录')
+            if request.get('submitted') is not True:
+                raise ValueError('只有已提交的原请求才能按平台未执行渲染进行对账')
+            if not selected.issubset(set(request.get('task_ids',[]))):
+                raise ValueError('未生成任务不属于此请求')
+            matching=[entry for _,_,entry in self._entries(acc)
+                      if entry.get('request_id')==request_id and entry.get('task_id') in selected]
+            if (len(matching)!=len(selected)
+                    or any(entry.get('state') not in ('submitted','unknown') or entry.get('remote_ref')
+                           for entry in matching)):
+                raise ValueError('未生成证据与额度状态不符；保留原账本待核对')
+            for entry in matching:
+                if entry.get('state') in ('submitted','unknown'):
+                    entry.update(state='rejected',rejection=deepcopy(evidence))
+                    released.append(entry['task_id'])
+            request['not_generated_task_ids']=sorted(set(request.get('not_generated_task_ids',[]))|set(released))
+        return released
+
     def release_failed_refunded(self,name,request_id,task_ids,evidence):
         """Release exact failed-card slots only after an explicit no-charge platform result."""
         failed=evidence.get('failed_task_ids',evidence.get('failed_card_task_ids')) if isinstance(evidence,dict) else None
@@ -309,7 +414,10 @@ class AccountManager:
         with self.store.txn() as data:
             for name in self.names:
                 acc=data['accounts'].get(name,{})
-                if acc.get('status')==AVAILABLE and self._public(acc)['remaining']>0:
+                quota=self._public(acc)
+                if (acc.get('status')==AVAILABLE and quota['remaining']>0
+                        and quota['pending_recovery']==0 and quota['unknown']==0
+                        and quota['awaiting_approval']==0):
                     acc['status']=BUSY;return name
         return ''
 
@@ -328,6 +436,17 @@ class AccountManager:
         self.observe_remaining(name,0)
         self._set(name,EXHAUSTED,note or '平台提示今日额度已耗尽',mark_date=True)
 
+    def mark_startup_retryable(self,name,note=''):
+        """Record a recoverable browser startup failure without disabling the account."""
+        with self.store.txn() as data:
+            acc=self._account(data,name)
+            quota=self._public(acc)
+            exhausted=(self._day(acc).get('platform_exhausted')
+                       or quota['used']>=quota['limit'])
+            acc.update(status=EXHAUSTED if exhausted else AVAILABLE,
+                       note=note or '浏览器启动暂时失败，可重试')
+            acc['date']=self._today() if exhausted else ''
+
     def mark_needs_login(self,name,note=''):self._set(name,NEEDS_LOGIN,note or '登录失效')
     def mark_disabled(self,name,note=''):self._set(name,DISABLED,note)
 
@@ -341,7 +460,11 @@ class AccountManager:
         accounts=self.store.snapshot().get('accounts',{})
         for account in accounts.values():self._normalize(account)
         return any(accounts.get(n,{}).get('status') in (AVAILABLE,BUSY,'checking')
-                   and self._public(accounts[n])['remaining']>0 for n in self.names if n in accounts)
+                   and self._public(accounts[n])['remaining']>0
+                   and self._public(accounts[n])['pending_recovery']==0
+                   and self._public(accounts[n])['unknown']==0
+                   and self._public(accounts[n])['awaiting_approval']==0
+                   for n in self.names if n in accounts)
 
     def blocked_report(self):
         return '\n'.join(f"  - {n}: {self.status(n).get('status','?')} 剩余{self.quota(n)['remaining']}/{self.daily_limit} "

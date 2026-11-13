@@ -69,7 +69,8 @@ class LocalSecurityTests(unittest.TestCase):
                 with self.subTest(url=url, method=method, token='missing' if token is None else 'wrong'):
                     response = self.client.open(url, method=method, json={}, headers=headers)
                     self.assertEqual(response.status_code, 403)
-                    self.assertEqual(response.json.get('code'), 'csrf_invalid')
+                    expected = 'reload_token_invalid' if url == '/api/service/prepare-reload' else 'csrf_invalid'
+                    self.assertEqual(response.json.get('code'), expected)
 
     def test_missing_or_invalid_origin_rejected_even_with_token(self):
         for origin in (None, 'null', 'https://attacker.example', 'http://localhost.attacker.example',

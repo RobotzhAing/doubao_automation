@@ -1,5 +1,6 @@
 """回归：保存、运行输入、视频传输和跨进程状态一致性。"""
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -50,6 +51,22 @@ class DashboardTests(unittest.TestCase):
     def test_stale_record_is_rejected(self):
         r=self.client.post('/api/edit',json={'rows':[{'record_id':'missing','keyword':'x','prompt_text':'y'}]})
         self.assertEqual(r.status_code,400)
+
+    def test_service_reload_requires_private_token_and_blocks_new_writes(self):
+        with patch.dict(os.environ,{'DOUBAO_DASHBOARD_RELOAD_TOKEN':'reload-secret'}), \
+             patch.object(dashboard,'shutdown_pending',False), \
+             patch.object(dashboard,'inflight_mutations',0), \
+             patch.object(dashboard,'running',return_value=False), \
+             patch.object(dashboard,'account_windows_open',return_value=False), \
+             patch.object(dashboard,'readonly_postprocess_busy',return_value=False):
+            denied=self.client.post('/api/service/prepare-reload',json={})
+            self.assertEqual(denied.status_code,403)
+            ready=self.client.post('/api/service/prepare-reload',json={},headers={
+                'X-Dashboard-Reload-Token':'reload-secret'})
+            self.assertEqual(ready.status_code,200,ready.json)
+            self.assertTrue(ready.json['shutdown_pending'])
+            blocked=self.client.post('/api/run',json={})
+            self.assertEqual(blocked.status_code,503)
 
     def test_run_uses_saved_sources_and_unique_output(self):
         child=Mock();child.pid=123;child.poll.return_value=None
@@ -118,7 +135,7 @@ class DashboardTests(unittest.TestCase):
                 self.assertTrue(source.exists())
 
     def test_vanished_file_during_list_does_not_break_polling(self):
-        vanished=Mock();vanished.stat.side_effect=FileNotFoundError()
+        vanished=Mock();vanished.name='vanished.mp4';vanished.stat.side_effect=FileNotFoundError()
         with patch.object(dashboard,'VIDEOS_DIR') as directory:
             directory.glob.return_value=[vanished]
             response=self.client.get('/api/videos')

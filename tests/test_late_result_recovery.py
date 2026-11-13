@@ -167,6 +167,67 @@ class LateResultRecoveryTests(unittest.TestCase):
         self.assertEqual(self.pipeline.accounts.quota('a')['reserved'], 1)
         self.assertEqual(len(self.pipeline.store.snapshot()['requests']), 1)
 
+    def test_persisted_unknown_request_gets_bounded_read_only_resume(self):
+        tasks = self.seed_waiting(error_kind='timeout')
+        agent = Mock()
+        agent.run_batch.return_value = dict(
+            videos={}, remote_refs={}, unresolved=[tasks[0]['id']], submitted=True,
+            chat_url=CHAT_URL, error_kind='timeout', error='still waiting',
+        )
+
+        self.assertFalse(self.pipeline._execute_batch(agent, 'a', tasks))
+
+        context = agent.run_batch.call_args.args[3]
+        self.assertTrue(context['resume_only'])
+        self.assertEqual(context['recovery_timeout_seconds'], 45)
+        self.assertNotIn('on_quota_remaining', context)
+        self.assertEqual(self.h.sent, 0)
+        saved = self.pipeline.store.snapshot()
+        self.assertEqual(saved['tasks'][0]['status'], 'awaiting_result')
+        self.assertEqual(saved['requests'][tasks[0]['request_id']]['phase'], 'unknown')
+        self.assertEqual(self.pipeline.accounts.quota('a')['unknown'], 1)
+
+    def test_nontransient_unknown_does_not_get_automatic_bounded_recheck(self):
+        tasks = self.seed_waiting(error_kind='needs_user')
+        agent = Mock()
+        agent.run_batch.return_value = dict(
+            videos={}, remote_refs={}, unresolved=[tasks[0]['id']], submitted=True,
+            chat_url=CHAT_URL, error_kind='needs_user', error='operator required',
+        )
+
+        self.assertFalse(self.pipeline._execute_batch(agent, 'a', tasks))
+
+        context = agent.run_batch.call_args.args[3]
+        self.assertTrue(context['resume_only'])
+        self.assertNotIn('recovery_timeout_seconds', context)
+        self.assertEqual(self.h.sent, 0)
+
+    def test_operator_confirmation_reconciliation_is_persisted_in_both_journals(self):
+        tasks = self.seed_waiting()
+        task = tasks[0]
+        control_text = '确认，开始生成这条视频。'
+        agent = Mock()
+
+        def resume_only(batch, images, dests, context, on_submitted, on_generated):
+            baseline = context['baseline']
+            baseline['ownership'].setdefault('control_texts', []).append(control_text)
+            baseline.setdefault('controls', []).append({
+                'phase': 'operator_confirmed_resume', 'task_ids': [task['id']],
+                'message_text': control_text, 'message_id': 'confirmed-turn',
+            })
+            on_submitted(CHAT_URL, baseline)
+            return dict(videos={}, remote_refs={}, unresolved=[task['id']], submitted=True,
+                        chat_url=CHAT_URL, error_kind='timeout', error='still waiting')
+
+        agent.run_batch.side_effect = resume_only
+        self.assertFalse(self.pipeline._execute_batch(agent, 'a', tasks, recovery_timeout_seconds=45))
+
+        request = self.pipeline.store.snapshot()['requests'][task['request_id']]
+        ledger = self.pipeline.accounts.request('a', task['request_id'])
+        self.assertEqual(request['baseline'], ledger['baseline'])
+        self.assertIn(control_text, request['baseline']['ownership']['control_texts'])
+        self.assertEqual(request['baseline']['controls'][-1]['phase'], 'operator_confirmed_resume')
+
     def test_short_lookup_cannot_release_or_exhaust_from_dialog_or_quota_text(self):
         for kind in ('quota', 'partial_failed_refunded', 'user_approval'):
             with self.subTest(kind=kind):

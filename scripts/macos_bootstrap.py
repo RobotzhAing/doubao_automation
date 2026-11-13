@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.dont_write_bytecode = True
-MODULE_CHECK = 'import flask, requests, yaml; import playwright.sync_api'
+MODULE_CHECK = 'import flask, requests, yaml; import playwright.sync_api; import cryptography'
 
 
 def configure_data_environment(root=ROOT, environ=None, home=None):
@@ -37,30 +37,40 @@ def configure_data_environment(root=ROOT, environ=None, home=None):
     return data, config
 
 
-def startup_log(data):
-    path = data / 'logs/macos_startup.log'
+def startup_log(data, filename="macos_startup.log"):
+    path = data / "logs" / filename
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    os.fchmod(fd, 0o600)
-    os.close(fd)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
     return path
 
 
 @contextmanager
-def setup_lock(data, timeout=900):
+def setup_lock(data, timeout=900, name="macos_bootstrap"):
     """Two Finder clicks must not install into the same venv concurrently."""
-    import fcntl
-    path = data / '.tmp/macos_bootstrap.lock'
+    path = data / '.tmp' / (name + '.lock')
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
+        if not os.fstat(fd).st_size:
+            os.write(fd, b"0")
         deadline = time.monotonic() + timeout
         announced = False
         while True:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if os.name == 'nt':
+                    import msvcrt
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
-            except BlockingIOError:
+            except OSError:
                 if time.monotonic() >= deadline:
                     raise RuntimeError('另一个启动器仍在准备环境，等待超时；请查看启动日志。')
                 if not announced:
@@ -86,7 +96,7 @@ def check_ffmpeg():
 
 
 def ensure_virtualenv(root, log):
-    python = root / '.venv/bin/python'
+    python = root / ('.venv/Scripts/python.exe' if os.name == 'nt' else '.venv/bin/python')
     if python.is_file() and os.access(python, os.X_OK):
         return python
     if (root / '.venv').exists():

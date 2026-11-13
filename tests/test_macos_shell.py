@@ -15,6 +15,18 @@ from doubao_automation import windows_shell
 
 
 class MacOSFolderTests(unittest.TestCase):
+    def test_finder_opens_batch_directory_instead_of_revealing_it(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            folder = root / 'batches' / 'r20261113_120002_abcd' / '2026-11-13 12:00'
+            folder.mkdir(parents=True)
+            with patch.object(windows_shell, 'VIDEOS_DIR', root), \
+                 patch.object(windows_shell.sys, 'platform', 'darwin'), \
+                 patch.object(windows_shell.subprocess, 'run',
+                              return_value=SimpleNamespace(returncode=0, stderr='')) as call:
+                windows_shell.open_video_folder(folder)
+            self.assertEqual(call.call_args.args[0], ['/usr/bin/open', str(folder.resolve())])
+
     def test_finder_receives_valid_video_without_a_shell(self):
         video = windows_shell.VIDEOS_DIR / 'video.mp4'
         with patch.object(Path, 'is_file', return_value=True), \

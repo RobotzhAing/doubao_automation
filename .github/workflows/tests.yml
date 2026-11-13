@@ -86,3 +86,40 @@ jobs:
           for test_file in tests/*.cjs; do
             node "$test_file"
           done
+
+  windows-startup:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: "3.12"
+      - name: Install FFmpeg
+        run: choco install ffmpeg --yes --no-progress
+      - name: Start from a clean checkout and verify the local dashboard
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:ChocolateyInstall\bin;$env:PATH"
+          cmd.exe /d /c start_dashboard.bat
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $state = Invoke-RestMethod 'http://127.0.0.1:8782/api/state'
+          if ($state.project_root -ne (Get-Location).Path -or $state.running) {
+            throw 'Incorrect project identity or unexpected running pipeline'
+          }
+          if (!(Test-Path .venv/Scripts/python.exe) -or !(Test-Path config/config.yaml)) {
+            throw 'First startup did not create the expected local environment'
+          }
+      - name: Run Windows bootstrap tests
+        run: .venv/Scripts/python.exe -m unittest discover -s tests -p test_windows_bootstrap.py
+      - name: Show bootstrap log if startup fails
+        if: failure()
+        shell: pwsh
+        run: |
+          if (Test-Path logs/windows_startup.log) { Get-Content logs/windows_startup.log -Tail 100 }
+          if (Test-Path logs/dashboard.log) { Get-Content logs/dashboard.log -Tail 100 }

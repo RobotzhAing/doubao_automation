@@ -58,6 +58,26 @@ class QuotaTests(unittest.TestCase):
         self.assertEqual(quota['limit'], 4)
         self.assertIs(quota['estimated'], True)
 
+    def test_legacy_composer_startup_failure_is_recovered_but_other_disables_are_preserved(self):
+        legacy = Path(self.tmp.name) / 'disabled-legacy.json'
+        with JsonStore(legacy).txn() as data:
+            data['accounts'] = {
+                'a': {'status': 'disabled', 'note': '[a] 找不到可用对话输入框，请校准选择器'},
+                'b': {'status': 'disabled', 'note': 'operator disabled'},
+            }
+        manager = AccountManager(JsonStore(legacy), ['a', 'b'], clock=self.clock)
+        self.assertEqual(manager.status('a')['status'], 'available')
+        self.assertIn('恢复', manager.status('a')['note'])
+        self.assertEqual(manager.status('b')['status'], 'disabled')
+        manager.reserve('a', ['retry-after-startup-error'], 'request-retry')
+        self.assertEqual(manager.quota('a')['reserved'], 1)
+
+    def test_retryable_startup_failure_preserves_true_quota_exhaustion(self):
+        self.manager.observe_remaining('a', 0)
+        self.manager.mark_startup_retryable('a', 'composer not ready')
+        self.assertEqual(self.manager.status('a')['status'], 'exhausted')
+        self.assertEqual(self.manager.quota('a')['remaining'], 0)
+
     def test_two_videos_reserve_two_units_not_one_request_unit(self):
         self.manager.reserve('a', ['s#0', 's#1'], 'request-1')
         quota = self.manager.quota('a')
@@ -207,6 +227,21 @@ class QuotaTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.manager.release_rejected('a','request-1',['s#0'],proof)
         self.assertEqual(self.manager.quota('a')['unknown'],1)
+
+    def test_explicit_no_render_reply_releases_only_uncredited_unknown_slot(self):
+        self.manager.reserve('a',['s#0'],'request-no-render')
+        self.manager.mark_submitted('a','request-no-render')
+        self.manager.mark_unknown('a','request-no-render',note='assistant did not render a video')
+        proof=dict(kind='generation_unavailable',definitive=True,active=False,
+                   source='latest_assistant',video_asset_found=False)
+        self.assertEqual(self.manager.release_not_generated('a','request-no-render',['s#0'],proof),['s#0'])
+        self.assertEqual((self.manager.quota('a')['used'],self.manager.quota('a')['unknown'],
+                          self.manager.quota('a')['remaining']),(0,0,4))
+        self.assertEqual(self.manager.find_task('s#0',include_inactive=True)['state'],'rejected')
+        for invalid in ({},dict(proof,active=True),dict(proof,video_asset_found=True),
+                        dict(proof,source='body_delta')):
+            with self.assertRaises(ValueError):
+                self.manager.release_not_generated('b','missing-request',['s#0'],invalid)
 
     @staticmethod
     def refunded_proof(*task_ids):
@@ -376,10 +411,48 @@ class QuotaTests(unittest.TestCase):
         self.manager.mark_unknown('a', 'old-request')
         self.clock.value += timedelta(minutes=2)
         quota = self.manager.quota('a')
-        self.assertEqual((quota['used'], quota['unknown']), (0, 1))
+        self.assertEqual((quota['used'], quota['unknown'], quota['remaining']), (0, 0, 4))
+        self.assertEqual(quota['pending_recovery'], 1)
+        self.assertIn('历史请求', quota['blocked_reason'])
         with self.assertRaises(ValueError):
             self.manager.reserve('a', ['new-task'], 'new-request')
+        self.assertEqual(self.manager.pick(), 'b', 'an account with an old unresolved request is skipped')
         self.assertEqual(self.manager.find_task('s#0')['state'], 'unknown')
+
+    def test_operator_archives_exact_prior_day_unknown_request_without_erasing_ledger(self):
+        self.manager.reserve('a',['old#0'],'old-request')
+        self.manager.mark_submitted('a','old-request')
+        self.manager.mark_unknown('a','old-request',note='result not located')
+        self.clock.value+=timedelta(days=1)
+        result=self.manager.archive_unknown_requests(
+            [dict(account='a',request_id='old-request',task_ids=['old#0'])],
+            'replaced by a newly submitted run')
+        self.assertEqual(result['archived'][0]['request_id'],'old-request')
+        entry=self.manager.request('a','old-request')['entries']['old#0']
+        self.assertEqual(entry['state'],'archived_unknown')
+        self.assertEqual(entry['pre_archive_state'],'unknown')
+        self.assertEqual(self.manager.request('a','old-request')['resolution'],'operator_archived_unknown')
+        self.assertIsNone(self.manager.find_task('old#0'))
+        self.assertEqual(self.manager.find_task('old#0',include_inactive=True)['state'],'archived_unknown')
+        quota=self.manager.quota('a')
+        self.assertEqual((quota['used'],quota['unknown'],quota['pending_recovery'],quota['remaining']),
+                         (0,0,0,4))
+        self.manager.reserve('a',['new#0'],'new-request')
+        with self.assertRaisesRegex(ValueError,'不能再次提交'):
+            self.manager.mark_submitted('a','old-request')
+        with self.assertRaisesRegex(ValueError,'无法唯一确定'):
+            self.manager.record_generated('a','old#0',request_id='old-request')
+
+    def test_operator_cannot_archive_same_day_unknown_request(self):
+        self.manager.reserve('a',['today#0'],'today-request')
+        self.manager.mark_submitted('a','today-request')
+        self.manager.mark_unknown('a','today-request')
+        before=self.manager.store.snapshot()
+        with self.assertRaisesRegex(ValueError,'当天或未来日期'):
+            self.manager.archive_unknown_requests(
+                [dict(account='a',request_id='today-request',task_ids=['today#0'])],
+                'not safe to release today')
+        self.assertEqual(self.manager.store.snapshot(),before)
 
     def test_cross_day_pending_request_is_not_reserved_or_charged_again_today(self):
         self.clock.value = datetime(2026, 10, 30, 15, 59, tzinfo=timezone.utc)
@@ -390,16 +463,31 @@ class QuotaTests(unittest.TestCase):
         self.clock.value += timedelta(minutes=2)
         manager = self.new_manager()
         before = manager.quota('a')
+        self.assertEqual((before['used'], before['reserved'], before['unknown'], before['remaining']),
+                         (0, 0, 0, 4))
+        self.assertEqual(before['pending_recovery'], 2)
         manager.reserve('a', ['s#0', 's#1'], 'request-1')
         after = manager.quota('a')
         for key in ('used', 'reserved', 'unknown', 'remaining'):
             self.assertEqual(after[key], before[key], key)
         manager.record_generated('a', 's#0', request_id='request-1')
         self.assertEqual(manager.quota('a')['used'], before['used'])
+        self.assertEqual(manager.quota('a')['pending_recovery'], 1)
         self.clock.value = yesterday
         old_quota = manager.quota('a')
         self.assertEqual(old_quota['used'], 1)
         self.assertEqual(old_quota['unknown'], 1)
+
+    def test_yesterdays_unsubmitted_reservation_moves_to_actual_submission_day(self):
+        self.clock.value = datetime(2026, 10, 30, 15, 59, tzinfo=timezone.utc)
+        self.manager.reserve('a', ['s#0'], 'old-reservation')
+        self.clock.value += timedelta(minutes=2)
+        before = self.manager.quota('a')
+        self.assertEqual((before['reserved'], before['unknown'], before['remaining']), (0, 0, 4))
+        self.manager.mark_submitted('a', 'old-reservation')
+        after = self.manager.quota('a')
+        self.assertEqual((after['reserved'], after['unknown'], after['remaining']), (0, 1, 3))
+        self.assertEqual(self.manager.find_task('s#0')['date'], after['date'])
 
     def test_reservation_survives_account_manager_restart(self):
         self.manager.reserve('a', ['s#0', 's#1'], 'request-1')

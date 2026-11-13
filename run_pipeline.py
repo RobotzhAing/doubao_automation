@@ -29,10 +29,12 @@ from doubao_automation.gemini_web import GeminiWeb
 from doubao_automation.orchestrator import Pipeline
 from doubao_automation.paths import VIDEOS_DIR, WORKSPACE, ensure_dirs, use_workspace_temp
 from doubao_automation.video_utils import concat_videos, find_ffmpeg
+from doubao_automation.video_archive import backfill
 
 
 def cmd_pipeline(args, cfg):
     p = Pipeline(cfg)
+    p.recovery_request_ids = list(getattr(args, 'recover_request_id', []) or [])
     if args.stage == "all":
         p.run_all(force=args.force, from_saved=args.from_saved, limit=args.limit or 0)
     elif args.stage == "fetch":
@@ -42,7 +44,10 @@ def cmd_pipeline(args, cfg):
     elif args.stage == "plan":
         p.stage_plan(force=args.force)
     elif args.stage == "run":
-        p.stage_run()
+        if getattr(args, 'wait_for_quota_reset', False):
+            p.stage_run_waiting_for_quota_reset()
+        else:
+            p.stage_run()
     elif args.stage == "status":
         p.report()
 
@@ -178,6 +183,7 @@ def cmd_concat(args, cfg):
         return 2
     out = VIDEOS_DIR / f"{snap_ids}_final.mp4"
     concat_videos(segs, out, find_ffmpeg(get(cfg, "video.ffmpeg", "auto")))
+    Pipeline._publish_archive_video(out)
     print(f"已拼接: {out}")
     return 0
 
@@ -191,6 +197,11 @@ def main():
         sp.add_argument("--force", action="store_true")
         sp.add_argument("--from-saved", action="store_true", help="使用面板已保存素材，不重新同步飞书")
         sp.add_argument("--limit", type=int, default=0, help="scripts 阶段最多处理前 N 条源记录")
+        if stage == "run":
+            sp.add_argument('--recover-request-id', action='append', default=[],
+                            help='恢复已验证的原会话请求；仅供工作台传入明确选中的请求编号')
+            sp.add_argument('--wait-for-quota-reset', action='store_true',
+                            help='额度耗尽时等待北京时间次日额度日切换，并自动续跑已保存任务')
         sp.set_defaults(func=cmd_pipeline, stage=stage)
 
     sp = sub.add_parser("inspect-doubao")
@@ -215,8 +226,13 @@ def main():
     sp.add_argument("--script", required=True, help="脚本 ID，如 s0_1")
     sp.set_defaults(func=cmd_concat)
 
+    sub.add_parser("archive-videos", help="把已有成片按任务启动时间归档，不移动原始下载")
+
     args = ap.parse_args()
     try:
+        if args.cmd == 'archive-videos':
+            print(f'已整理 {backfill(VIDEOS_DIR)} 个批次文件夹')
+            return 0
         cfg = load_config()
         ensure_dirs()
         use_workspace_temp()

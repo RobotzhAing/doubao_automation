@@ -91,6 +91,72 @@ class PipelineAccountTests(unittest.TestCase):
             pipeline.stage_run()
         stage.assert_called_once_with()
 
+    def test_waiting_runner_retries_only_after_quota_reset_wait(self):
+        pipeline = orchestrator.Pipeline({'accounts': {'doubao': [dict(name='fixture')]}})
+        with patch.object(pipeline, '_stage_run_locked', return_value='complete') as run, \
+             patch.object(pipeline, '_can_wait_for_quota_reset', side_effect=[True, False]), \
+             patch.object(pipeline, '_seconds_until_quota_reset', return_value=12.5), \
+             patch.object(pipeline, '_wait_for_next_quota_day') as wait:
+            self.assertEqual(pipeline.stage_run_waiting_for_quota_reset(), 'complete')
+        run.assert_called_once_with()
+        wait.assert_called_once_with()
+
+    def test_waiting_runner_rechecks_clean_pending_after_quota_exhaustion(self):
+        pipeline = orchestrator.Pipeline({'accounts': {'doubao': [dict(name='fixture')]}})
+        quota_exhausted = RuntimeError('流程未完成：完成2/4，待恢复2，失败0；未决请求只恢复原会话，不重新生成')
+        with patch.object(pipeline, '_stage_run_locked', side_effect=[quota_exhausted, 'complete']) as run, \
+             patch.object(pipeline, '_can_wait_for_quota_reset', side_effect=[False, True, False]), \
+             patch.object(pipeline, '_wait_for_next_quota_day') as wait:
+            self.assertEqual(pipeline.stage_run_waiting_for_quota_reset(), 'complete')
+        self.assertEqual(run.call_count, 2)
+        wait.assert_called_once_with()
+
+    def test_waiting_runner_surfaces_non_quota_failures_without_sleeping(self):
+        pipeline = orchestrator.Pipeline({'accounts': {'doubao': [dict(name='fixture')]}})
+        with patch.object(pipeline, '_stage_run_locked', side_effect=RuntimeError('needs operator action')), \
+             patch.object(pipeline, '_can_wait_for_quota_reset', return_value=False), \
+             patch.object(pipeline, '_wait_for_next_quota_day') as wait:
+            with self.assertRaisesRegex(RuntimeError, 'needs operator action'):
+                pipeline.stage_run_waiting_for_quota_reset()
+        wait.assert_not_called()
+
+    def test_quota_reset_deadline_uses_beijing_midnight(self):
+        from datetime import datetime, timedelta, timezone
+        now = datetime(2026, 11, 12, 23, 59, 59,
+                       tzinfo=timezone(timedelta(hours=8), 'Asia/Shanghai'))
+        self.assertEqual(orchestrator.Pipeline._seconds_until_quota_reset(now), 2.0)
+
+    def test_quota_wait_gate_requires_only_clean_pending_tasks_and_zero_quota(self):
+        pipeline = orchestrator.Pipeline({'accounts': {'doubao': [dict(name='fixture')]}})
+        pipeline.store.reset({'tasks': [dict(id='task-1', status='pending', request_id='')],
+                              'requests': {}})
+        with patch.object(pipeline.accounts, 'status', return_value={'status': 'available'}), \
+             patch.object(pipeline.accounts, 'quota', return_value={
+                 'remaining': 0, 'pending_recovery': 0, 'unknown': 0, 'awaiting_approval': 0}):
+            self.assertTrue(pipeline._can_wait_for_quota_reset())
+        with patch.object(pipeline.accounts, 'status', return_value={'status': 'available'}), \
+             patch.object(pipeline.accounts, 'quota', return_value={
+                 'remaining': 1, 'pending_recovery': 0, 'unknown': 0, 'awaiting_approval': 0}):
+            self.assertFalse(pipeline._can_wait_for_quota_reset())
+
+        pipeline.store.reset({'tasks': [dict(id='task-1', status='awaiting_result', request_id='rid')],
+                              'requests': {'rid': dict(phase='unknown', task_ids=['task-1'])}})
+        with patch.object(pipeline.accounts, 'status', return_value={'status': 'available'}), \
+             patch.object(pipeline.accounts, 'quota', return_value={
+                 'remaining': 0, 'pending_recovery': 0, 'unknown': 1, 'awaiting_approval': 0}):
+            self.assertFalse(pipeline._can_wait_for_quota_reset())
+
+    def test_cli_exposes_opt_in_wait_for_quota_reset(self):
+        cfg = {'accounts': {'doubao': [dict(name='fixture')]}}
+        with patch.object(sys, 'argv', ['run_pipeline.py', 'run', '--wait-for-quota-reset']), \
+             patch.object(run_pipeline, 'load_config', return_value=cfg), \
+             patch.object(run_pipeline, 'ensure_dirs'), \
+             patch.object(run_pipeline, 'use_workspace_temp'), \
+             patch.object(run_pipeline, 'Pipeline') as pipeline_cls:
+            self.assertEqual(run_pipeline.main(), 0)
+        pipeline_cls.return_value.stage_run_waiting_for_quota_reset.assert_called_once_with()
+        pipeline_cls.return_value.stage_run.assert_not_called()
+
     def test_cli_explains_disabled_accounts_without_traceback(self):
         cfg = {'accounts': {'doubao': [dict(name='fixture', enabled=False)]}}
         with patch.object(sys, 'argv', ['run_pipeline.py', 'run']), \

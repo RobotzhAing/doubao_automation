@@ -14,11 +14,12 @@ _lock = threading.Lock()
 
 def open_video_folder(path):
     path = Path(path).resolve()
-    if not path.is_file() or VIDEOS_DIR.resolve() not in path.parents:
+    directory = path.is_dir()
+    if (not directory and not path.is_file()) or VIDEOS_DIR.resolve() not in path.parents:
         raise FileNotFoundError(f'视频文件不存在或不在下载目录：{path}')
     if sys.platform == 'darwin':
         try:
-            result = subprocess.run(['/usr/bin/open', '-R', str(path)],
+            result = subprocess.run(['/usr/bin/open', *([] if directory else ['-R']), str(path)],
                                     capture_output=True, text=True, timeout=15)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise OSError('无法请求 Finder 显示文件，请检查系统权限') from exc
@@ -34,7 +35,10 @@ def open_video_folder(path):
         request_id = uuid.uuid4().hex
         request = TEMP_DIR / 'desktop_folder_request.json'
         tmp = request.with_suffix('.json.tmp')
-        tmp.write_text(json.dumps({'id':request_id}),encoding='utf-8')
+        payload = {'id':request_id}
+        if directory:
+            payload['folder'] = str(path.relative_to(VIDEOS_DIR.resolve()))
+        tmp.write_text(json.dumps(payload),encoding='utf-8')
         os.replace(tmp,request)
         response = TEMP_DIR / 'desktop_folder_response.json'
         deadline = time.monotonic() + 10
@@ -44,6 +48,8 @@ def open_video_folder(path):
                 if data.get('id') == request_id:
                     if not data.get('ok'):
                         raise OSError('Windows 未能打开目录：' + data.get('error','未知错误'))
+                    if directory and Path(data.get('folder','')).resolve() != path:
+                        raise OSError('桌面助手尚未载入批次文件夹支持，请重启桌面助手')
                     return
             except (FileNotFoundError,json.JSONDecodeError):
                 pass

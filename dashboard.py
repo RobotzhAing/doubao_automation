@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, render_template_string, send_from_directory, send_file, abort
+from flask import Flask, jsonify, request, render_template_string, send_from_directory, send_file, abort, g
 from pathlib import Path
 import datetime
 import copy
@@ -6,6 +6,7 @@ import json
 import ipaddress
 import secrets
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -15,10 +16,13 @@ import traceback
 import uuid
 if sys.platform == 'darwin':
     sys.dont_write_bytecode = True
-from doubao_automation.paths import DATA_ROOT, STATE_DIR, ROOT, PROFILES, PRODUCTS_DIR, SOURCES_DIR, VIDEOS_DIR, LOGS_DIR, resolve, use_workspace_temp
+from doubao_automation.paths import (DATA_ROOT, STATE_DIR, ROOT, PROFILES, PRODUCTS_DIR, SOURCES_DIR,
+                                     SCRIPTS_DIR, VIDEOS_DIR, FRAMES_DIR, LOGS_DIR, WORKSPACE, resolve,
+                                     use_workspace_temp)
 from doubao_automation.state import JsonStore
 from doubao_automation.account_manager import AccountManager
 from doubao_automation.orchestrator import Pipeline
+from doubao_automation.doubao_batch import BatchGenerationMixin, formal_doubao_chat_path
 from doubao_automation.config import DEFAULT_CONFIG_PATH, load_config, require_doubao_accounts, save_config
 from doubao_automation.doubao_login import probe_doubao_login, session_pages
 from doubao_automation.caption_context import (caption_source, caption_images, caption_videos, caption_target,
@@ -26,7 +30,7 @@ from doubao_automation.caption_context import (caption_source, caption_images, c
                                                link_caption_binding, put_link_caption, MAX_DESCRIPTION)
 from doubao_automation.feishu_client import FeishuClient
 from doubao_automation.windows_shell import open_video_folder
-from doubao_automation import postprocess
+from doubao_automation import postprocess, video_archive
 from scripts.clear_history import preview_history
 
 app = Flask(__name__)
@@ -40,6 +44,7 @@ _ALLOWED_HOSTS = frozenset(('127.0.0.1', '127.0.0.1:8782', 'localhost', 'localho
 
 @app.before_request
 def enforce_local_request():
+    global inflight_mutations
     try:
         local_peer = ipaddress.ip_address(request.remote_addr or '').is_loopback
     except ValueError:
@@ -49,31 +54,48 @@ def enforce_local_request():
     host = request.headers.get('Host', '').lower()
     if request.scheme != 'http' or host not in _ALLOWED_HOSTS:
         return jsonify(error='不允许的本地 Host', code='host_invalid'), 403
+    internal_reload=request.path=='/api/service/prepare-reload' and request.method=='POST'
+    if internal_reload:
+        expected=os.environ.get('DOUBAO_DASHBOARD_RELOAD_TOKEN','')
+        supplied=request.headers.get('X-Dashboard-Reload-Token','')
+        if not expected or not secrets.compare_digest(supplied,expected):
+            return jsonify(error='后台重载令牌无效',code='reload_token_invalid'),403
+    elif request.method not in ('GET','HEAD') and shutdown_pending:
+        return jsonify(error='工作台正在安全重载，请稍候',code='reload_pending'),503
     origin = request.headers.get('Origin')
     same_origin = 'http://' + host
-    if origin is not None and origin != same_origin:
+    if not internal_reload and origin is not None and origin != same_origin:
         return jsonify(error='不允许的请求来源', code='origin_invalid'), 403
     if request.method == 'OPTIONS':
         return jsonify(error='不允许跨域请求', code='origin_invalid'), 403
-    if request.method not in ('GET', 'HEAD'):
+    if request.method not in ('GET', 'HEAD') and not internal_reload:
         if origin != same_origin:
             return jsonify(error='写操作必须来自本机同源页面', code='origin_invalid'), 403
         token = request.headers.get('X-CSRF-Token', '')
         if not token.isascii() or not secrets.compare_digest(token, CSRF_TOKEN):
             return jsonify(error='安全令牌无效，请刷新页面', code='csrf_invalid'), 403
+        with lock:
+            if shutdown_pending:
+                return jsonify(error='工作台正在安全重载，请稍候',code='reload_pending'),503
+            inflight_mutations+=1
+            g.counted_mutation=True
     elif request.path == '/api/csrf' and request.headers.get('Sec-Fetch-Site') == 'cross-site':
         return jsonify(error='不允许跨站读取安全令牌', code='origin_invalid'), 403
     if (os.environ.get('DOUBAO_CONTAINER_PREVIEW') == '1'
             and request.method not in ('GET', 'HEAD')
             and request.path in {'/api/run', '/api/accounts/add', '/api/accounts/open', '/api/accounts/visit',
                                  '/api/captions/generate', '/api/captions/link/generate',
-                                 '/api/open-video', '/api/videos/approve'}):
+                                 '/api/open-video', '/api/video-batches/open', '/api/videos/approve'}):
         return jsonify(error='容器预览版不支持启动浏览器、桌面操作或视频后处理',
                        code='container_unsupported'), 501
 
 
 @app.after_request
 def protect_response(response):
+    global inflight_mutations
+    if getattr(g,'counted_mutation',False):
+        with lock:
+            inflight_mutations=max(0,inflight_mutations-1)
     response.headers['Cache-Control'] = 'no-store'
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'DENY'
@@ -84,6 +106,8 @@ lock = threading.RLock()
 proc = None
 pending_accounts = {}
 caption_model_lock = threading.Lock()
+shutdown_pending = False
+inflight_mutations = 0
 
 # HTML is inserted here by the migration script.
 HTML=r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>豆包 Studio</title><style>*{box-sizing:border-box}body{margin:0;background:#f5f5f7;color:#1d1d1f;font:15px -apple-system,BlinkMacSystemFont,"SF Pro Display",system-ui}.shell{max-width:1160px;margin:auto;padding:28px 22px}header{display:flex;align-items:center;gap:24px;margin-bottom:24px}.logo{font-size:24px;font-weight:750}.nav{display:flex;gap:6px;background:#e9e9ed;padding:5px;border-radius:14px}.nav button{background:transparent;color:#515154;padding:9px 16px;border:0;cursor:pointer}.nav button.active{background:white;box-shadow:0 1px 5px #0002}.status{margin-left:auto;background:#e8f8ee;color:#168044;border-radius:99px;padding:8px 13px;font-size:13px}.card{background:#fff;border:1px solid #e8e8ed;border-radius:20px;padding:22px;margin:14px 0;box-shadow:0 3px 12px #00000008}h1{font-size:28px;margin:0 0 6px}h2{font-size:18px;margin:0 0 14px}.muted{color:#777;font-size:13px}.btn{border:0;border-radius:12px;padding:11px 17px;font-weight:650;background:#007aff;color:white;cursor:pointer}.btn.gray{background:#e9e9ed;color:#222}.btn.red{background:#fff0f0;color:#c22}.actions{display:flex;gap:9px;flex-wrap:wrap}.row{padding:16px;border:1px solid #e8e8ed;border-radius:16px;margin:12px 0}.grid{display:grid;grid-template-columns:220px 1fr;gap:12px}input,textarea{font:inherit;padding:11px;border:1px solid #d2d2d7;border-radius:11px;width:100%;background:white}textarea{min-height:110px}.thumbs{display:flex;gap:8px;overflow:auto;margin:8px 0}.thumbs img{width:90px;height:75px;object-fit:cover;border-radius:10px}.log{white-space:pre-wrap;background:#17171a;color:#eee;border-radius:14px;padding:14px;max-height:190px;overflow:auto}@media(max-width:700px){.grid{grid-template-columns:1fr}header{flex-wrap:wrap}}</style></head><body><main class="shell"><header><div class="logo">豆包 Studio</div><nav class="nav"><button id="navstudio" class="active" onclick="tab('studio')">工作台</button><button id="navaccounts" onclick="tab('accounts')">账号库</button><button id="navvideos" onclick="tab('videos')">已下载视频</button></nav><span class="status" id="status">● 连接中</span></header><section id="studio"><h1>视频自动化工作台</h1><p class="muted">飞书同步、Gemini脚本与豆包视频生成</p><article class="card"><h2>运行控制</h2><div class="actions"><button class="btn" onclick="syncFeishu()">同步飞书</button><span id="sync-result" role="status" aria-live="polite"></span><button class="btn gray" onclick="saveRows()">保存修改</button><button class="btn" onclick="run()">开启运行</button><button class="btn red" onclick="stop()">停止</button></div></article><article class="card"><h2>手动添加素材</h2><div class="grid"><label>keyword<input id="newkw"></label><label>提示词<textarea id="newprompt"></textarea></label><label>视频<input id="newvid" type="file" accept="video/*" multiple></label><label>产品图<input id="newimg" type="file" accept="image/*" multiple></label></div><button class="btn" onclick="upload()">添加素材</button></article><article class="card"><h2>提示词与视频记录</h2><div id="rows"></div></article></section><section id="accounts" style="display:none"><h1>豆包账号库</h1><article class="card"><div id="accountRows"></div><button class="btn" onclick="addAccount()">＋ 添加豆包账号</button></article></section><section id="videos" style="display:none"><h1>已下载视频</h1><div id="videoRows"></div></section><article class="card"><h2>操作消息</h2><pre class="log" id="log">就绪</pre></article><article class="card"><h2>运行日志</h2><pre class="log" id="runlog">暂无运行日志</pre></article></main><script src="/dashboard.js"></script></body></html>'''
@@ -191,7 +215,8 @@ def home():
                         '<button class="btn" onclick="run()">开启运行</button>')
     html = html.replace('<button class="btn red" onclick="stop()">停止</button>',
                         '<button class="btn red" onclick="stop()">停止</button>'
-                        '<button class="btn gray" onclick="previewClearHistory()">清除历史记录及对应文件（仅预览）</button>')
+                        '<button class="btn gray" onclick="previewClearHistory()">预览历史清理</button>'
+                        '<button id="archive-run" class="btn red" onclick="archiveStoppedRun()" disabled>删除已停止的旧任务</button>')
     return render_template_string(html, csrf_token=CSRF_TOKEN)
 
 
@@ -210,6 +235,8 @@ def history_preview():
 @app.get('/api/state')
 def state():
     d = readonly_snapshot(STATE_DIR / 'pipeline_state.json')
+    recovery=ledger_recovery_plan(d)
+    journal_resume=has_unfinished_plan(d)
     hidden_ids=set(d.get('hidden_source_ids',[]))
     synced_ids=d.get('synced_feishu_source_ids')
     restorable_hidden=hidden_ids & set(synced_ids) if isinstance(synced_ids,list) else hidden_ids
@@ -239,9 +266,16 @@ def state():
                    service_pid=int(os.environ.get('DOUBAO_DASHBOARD_SERVICE_PID','0')) or None,
                    login_windows_open=account_windows_open(),
                    postprocessing=readonly_postprocess_busy(),
+                   shutdown_pending=shutdown_pending,
                    running=running(),
-                    can_resume=has_unfinished_plan(d),resume_script_count=planned_script_count(d),resume_run_id=d.get('run_id',''),
-                   returncode=d.get('run_returncode'), log=log, tasks=d.get('tasks', []),
+                    can_resume=journal_resume or recovery['has_pending'],
+                    resume_script_count=planned_script_count(d) or recovery['script_count'],
+                    resume_run_id=(recovery['run_id'] if recovery['has_pending'] and not journal_resume
+                                   else d.get('run_id','')),
+                    recovery_request_ids=(recovery['request_ids']
+                                          if recovery['has_pending'] and not journal_resume else []),
+                    recovery_error=recovery['error'],
+                   run_id=d.get('run_id',''), returncode=d.get('run_returncode'), log=log, tasks=d.get('tasks', []),
                    product_rows=product_rows, sync_summary=d.get('sync_summary'),
                    hidden_sources=len(restorable_hidden),
                    unavailable_hidden_sources=len(hidden_ids-restorable_hidden),
@@ -654,19 +688,101 @@ def has_unfinished_plan(snap):
         output=Path(assembly.get('output') or VIDEOS_DIR/f'{script_id}_final.mp4')
         if assembly.get('status')!='done' or not output.is_file():
             return True
+    task_by_id={task.get('id'):task for task in tasks}
+    for request in (snap.get('requests') or {}).values():
+        if request.get('phase') not in ('reserved','submitted','unknown','downloading','awaiting_user_approval'):
+            continue
+        if any(task_by_id.get(tid,{}).get('status')!='done'
+               for tid in request.get('task_ids',request.get('original_task_ids',[]))):
+            return True
     return False
 
 
 def planned_script_count(snap):
     return (len(snap.get('scripts',[]))
             or len({task['script_id'] for task in snap.get('tasks',[]) if task.get('script_id')})
-            or len(snap.get('assemblies',{})) or 0)
+            or len(snap.get('assemblies',{}))
+            or len({str(tid).split('#seg',1)[0] for request in (snap.get('requests') or {}).values()
+                    for tid in request.get('task_ids',request.get('original_task_ids',[]))}) or 0)
+
+
+def ledger_recovery_plan(snap=None):
+    """Find a single provable group of submitted requests after journal loss."""
+    ledger=readonly_snapshot(STATE_DIR/'accounts.json').get('accounts',{})
+    pending=[]
+    candidates=[]
+    for account,acc in ledger.items():
+        for request_id,saved in acc.get('quota_requests',{}).items():
+            task_ids=saved.get('task_ids',[])
+            if not saved.get('submitted') or not isinstance(task_ids,list) or not task_ids:
+                continue
+            entries={}
+            for day in acc.get('quota_days',{}).values():
+                for entry in day.get('entries',{}).values():
+                    if entry.get('request_id')==request_id:
+                        entries[entry.get('task_id')]=entry
+            active=[tid for tid in task_ids if entries.get(tid,{}).get('state') in ('submitted','unknown')]
+            if not active:
+                continue
+            pending.append((account,request_id,active))
+            if len(task_ids)!=1 or active!=task_ids or not re.fullmatch(r'.+#seg0',str(task_ids[0])):
+                continue
+            chat_path=formal_doubao_chat_path(saved.get('chat_url',''))
+            baseline=saved.get('baseline') or {}
+            ownership=baseline.get('ownership') or {}
+            try:
+                proof=BatchGenerationMixin._original_anchor_proof(ownership,chat_path)
+            except (TypeError,ValueError):
+                continue
+            if (not chat_path or baseline.get('scope_version')!=1
+                    or baseline.get('ownership_acknowledged') is not True
+                    or ownership.get('chat_path')!=chat_path
+                    or ownership.get('marker')!=f'【自动化任务标记：{request_id}】'
+                    or ownership.get('original_anchor_proof')!=proof):
+                continue
+            script_id=task_ids[0].rsplit('#seg',1)[0]
+            match=re.fullmatch(r'(.+)_s\d+_\d+_[^#]+',script_id)
+            if not match:
+                continue
+            candidates.append(dict(account=account,request_id=request_id,task_ids=list(task_ids),
+                                   script_id=script_id,cohort=match.group(1)))
+    plan=dict(has_pending=bool(pending),request_ids=[],script_count=0,run_id='',error='')
+    if not pending:
+        return plan
+    cohorts={item['cohort'] for item in candidates}
+    if len(candidates)!=len(pending) or len(cohorts)!=1:
+        plan['error']='账号账本存在未决请求，但无法唯一验证为同一批原会话；已阻止新任务覆盖'
+        return plan
+    for account,request_id,_ in pending:
+        if not any(c['account']==account and c['request_id']==request_id for c in candidates):
+            plan['error']='账号账本请求与原会话证明不匹配；已阻止新任务覆盖'
+            return plan
+    task_ids=[tid for _,_,ids in pending for tid in ids]
+    log_matches=[p.stem for p in LOGS_DIR.glob('r*.log')
+                 if all(tid.startswith(p.stem) for tid in task_ids)]
+    plan.update(request_ids=[request_id for _,request_id,_ in pending],
+                script_count=len({item['script_id'] for item in candidates}),
+                run_id=max(log_matches,key=len) if log_matches else '')
+    return plan
+
+
+@app.post('/api/service/prepare-reload')
+def prepare_service_reload():
+    global shutdown_pending
+    with lock:
+        if (shutdown_pending or inflight_mutations or running() or caption_model_lock.locked()
+                or account_windows_open() or readonly_postprocess_busy()):
+            return jsonify(ok=False,error='工作台仍有运行中的任务或窗口，稍后再安全重载'),409
+        shutdown_pending=True
+    return jsonify(ok=True,server_pid=os.getpid(),shutdown_pending=True)
 
 
 @app.post('/api/run')
 def run():
     global proc
     with lock:
+        if shutdown_pending:
+            return jsonify(error='工作台正在安全重载，请稍候'),503
         if running():
             return jsonify(error='流水线已在运行'),409
         if caption_model_lock.locked():
@@ -677,16 +793,43 @@ def run():
         runner=Pipeline.__new__(Pipeline); runner.store=store()
         try:
             with runner._run_lock():
-                snap=runner.store.snapshot(); resumed=has_unfinished_plan(snap)
-                run_id=snap.get('run_id') if resumed else None
+                snap=runner.store.snapshot()
+                journal_resume=has_unfinished_plan(snap)
+                recovery=ledger_recovery_plan(snap) if not journal_resume else dict(has_pending=False)
+                resumed=journal_resume or recovery.get('has_pending',False)
+                recovery_ids=[]
+                if recovery.get('has_pending'):
+                    if recovery.get('error'):
+                        return jsonify(error=recovery['error']),409
+                    payload=request.get_json(silent=True) or {}
+                    requested=payload.get('recovery_request_ids')
+                    allowed=recovery.get('request_ids',[])
+                    if (not isinstance(requested,list) or len(requested)!=len(set(requested))
+                            or set(requested)!=set(allowed)):
+                        return jsonify(error='恢复请求清单已变化，请刷新后再启动；未修改原任务'),409
+                    enabled={a['name'] for a in load_config().get('accounts',{}).get('doubao',[])
+                             if a.get('enabled',True)}
+                    ledger_data=readonly_snapshot(STATE_DIR/'accounts.json').get('accounts',{})
+                    selected_accounts={name for name,acc in ledger_data.items()
+                                       if any(rid in acc.get('quota_requests',{}) for rid in allowed)}
+                    if not selected_accounts.issubset(enabled):
+                        return jsonify(error='恢复请求关联的账号未启用；未修改原任务'),409
+                    recovery_ids=allowed
+                run_id=(recovery.get('run_id') if recovery.get('has_pending') else snap.get('run_id')) if resumed else None
                 run_id=run_id or datetime.datetime.now().strftime('r%Y%m%d_%H%M%S_')+uuid.uuid4().hex[:4]
                 attempt_id=uuid.uuid4().hex
                 LOGS_DIR.mkdir(parents=True,exist_ok=True)
-                log_path=Path(snap['run_log']) if resumed and snap.get('run_log') else LOGS_DIR/(run_id+'.log')
+                log_path=(LOGS_DIR/(run_id+'.log') if recovery_ids else
+                          Path(snap['run_log']) if resumed and snap.get('run_log') else LOGS_DIR/(run_id+'.log'))
                 log_path.parent.mkdir(parents=True,exist_ok=True)
                 if resumed:
-                    script_count=planned_script_count(snap)
-                    command=[sys.executable,'-u','run_pipeline.py','run']
+                    script_count=(recovery.get('script_count',0) if recovery_ids else planned_script_count(snap))
+                    # Keep a quota-limited saved run alive through the next
+                    # Asia/Shanghai quota-day boundary; the runner sleeps only
+                    # when all remaining tasks are cleanly pending for quota.
+                    command=[sys.executable,'-u','run_pipeline.py','run','--wait-for-quota-reset']
+                    for request_id in recovery_ids:
+                        command.extend(['--recover-request-id',request_id])
                     with runner.store.txn() as d:
                         d.update(run_id=run_id,run_attempt_id=attempt_id,run_log=str(log_path),run_returncode=None)
                 else:
@@ -715,7 +858,8 @@ def run():
                                   cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
                                   creationflags=getattr(subprocess,'CREATE_NEW_PROCESS_GROUP',0))
         threading.Thread(target=watch_run,args=(proc,run_id,attempt_id),daemon=True).start()
-    message=(f'继续上次计划（{script_count}个脚本），已完成视频不重复生成；脚本数量沿用原计划'
+        message=(f'恢复原计划（{script_count}个脚本、{len(recovery_ids)}条原请求），仅核对原会话，不重发提示词'
+                 if recovery_ids else f'继续上次计划（{script_count}个脚本），已完成视频不重复生成；脚本数量沿用原计划'
              if resumed else '已启动新任务，脚本数量由提示词决定')
     return jsonify(ok=True,pid=proc.pid,script_count=script_count,log=str(log_path),resumed=resumed,message=message)
 
@@ -733,6 +877,134 @@ def stop():
         else:
             proc.terminate()
     return jsonify(ok=True,stopped=True)
+
+def _script_id_for_task(task_id, script_id=None):
+    """Map a planned task back to the script artifact written before planning."""
+    value=str(script_id or str(task_id).rsplit('#seg',1)[0])
+    return re.sub(r'_p[0-9a-f]{10}$','',value)
+
+
+def _archive_script_paths(task_ids, tasks=(), scripts=()):
+    """Resolve only script files bound to these task IDs, including legacy plan IDs."""
+    by_task={str(task.get('id')):task for task in tasks if isinstance(task,dict)}
+    script_root=SCRIPTS_DIR.resolve()
+    bases={_script_id_for_task(tid,by_task.get(str(tid),{}).get('script_id')) for tid in task_ids}
+    output=[]
+    for base in sorted(bases):
+        rows=[item for item in scripts if isinstance(item,dict)
+              and _script_id_for_task(item.get('id',''))==base]
+        recorded={str(item.get('file')) for item in rows if item.get('file')}
+        candidates=([Path(value).expanduser() for value in recorded] if recorded
+                    else list(SCRIPTS_DIR.glob(base+'_*.txt')))
+        resolved=set()
+        for candidate in candidates:
+            path=candidate.resolve()
+            if (script_root not in path.parents or path.suffix.lower()!='.txt'
+                    or not path.name.startswith(base+'_')):
+                raise ValueError('脚本文件路径不属于本批任务；未删除任何记录')
+            resolved.add(path)
+        if len(resolved)>1:
+            raise ValueError(f'任务 {base} 对应多个脚本文件；未删除任何记录')
+        output.extend(str(path) for path in resolved)
+    return sorted(set(output))
+
+@app.post('/api/run/archive')
+def archive_stopped_run():
+    body=request.get_json(silent=True) or {}
+    run_id=body.get('run_id');expected_ids=body.get('task_ids')
+    if (not isinstance(run_id,str) or not run_id
+            or not isinstance(expected_ids,list) or not expected_ids
+            or any(not isinstance(tid,str) or not tid for tid in expected_ids)
+            or len(set(expected_ids))!=len(expected_ids)):
+        raise ValueError('请提供当前运行编号和完整的旧任务编号清单')
+    with lock:
+        if running():return jsonify(error='任务仍在运行，请停止并确认进程退出后再清理'),409
+        if account_windows_open():return jsonify(error='账号窗口仍在使用，请关闭后再清理任务'),409
+        runner=Pipeline.__new__(Pipeline);runner.store=store()
+        try:
+            with runner._run_lock():
+                snap=runner.store.snapshot()
+                existing=next((item for item in snap.get('archived_runs',[])
+                               if item.get('run_id')==run_id and item.get('task_ids')==expected_ids),None)
+                if snap.get('run_id')==run_id:
+                    tasks=snap.get('tasks',[])
+                    actual_ids=[task.get('id') for task in tasks]
+                    if actual_ids!=expected_ids:
+                        return jsonify(error='任务清单已变化，请刷新后重试；未删除任何记录'),409
+                    if any(task.get('status')=='done' or task.get('raw_video') or task.get('video')
+                           or task.get('remote_ref') for task in tasks):
+                        return jsonify(error='任务包含已完成或已取得产物的视频；未删除任何记录'),409
+                    requests=snap.get('requests',{})
+                    grouped={}
+                    for task in tasks:
+                        rid=task.get('request_id');account=task.get('account')
+                        if not rid or not account:
+                            return jsonify(error='任务缺少额度账本绑定；未删除任何记录'),409
+                        grouped.setdefault((account,rid),[]).append(task['id'])
+                    bindings=[]
+                    for (account,rid),task_ids in grouped.items():
+                        saved=requests.get(rid,{})
+                        if (saved.get('account')!=account or saved.get('submitted') is not True
+                                or saved.get('task_ids')!=task_ids):
+                            return jsonify(error='任务与已提交额度账本不一致；未删除任何记录'),409
+                        bindings.append(dict(account=account,request_id=rid,task_ids=task_ids))
+                    script_ids={task.get('script_id') for task in tasks}
+                    try:
+                        script_paths=_archive_script_paths(expected_ids,tasks,snap.get('scripts',[]))
+                    except ValueError as exc:
+                        return jsonify(error=str(exc)),409
+                    archive_entry=dict(run_id=run_id,archived_at=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+                                       task_ids=list(expected_ids),request_bindings=bindings,
+                                       script_files=script_paths,run_log=snap.get('run_log',''),
+                                       task_count=len(tasks),script_count=len(script_ids))
+                elif existing:
+                    archive_entry=existing
+                    bindings=existing.get('request_bindings',[])
+                    script_paths=list(existing.get('script_files') or [])
+                    if not script_paths:
+                        try:
+                            script_paths=_archive_script_paths(expected_ids)
+                        except ValueError as exc:
+                            return jsonify(error=str(exc)),409
+                        archive_entry=dict(existing,script_files=script_paths)
+                else:
+                    return jsonify(error='运行编号已变化或不属于当前历史；未删除任何记录'),409
+                valid_bases={_script_id_for_task(tid) for tid in expected_ids}
+                for value in script_paths:
+                    path=Path(value).expanduser().resolve()
+                    if (SCRIPTS_DIR.resolve() not in path.parents or path.suffix.lower()!='.txt'
+                            or not any(path.name.startswith(base+'_') for base in valid_bases)):
+                        return jsonify(error='脚本文件路径不属于本批任务；未删除任何记录'),409
+                manager=account_manager([item['name'] for item in load_config().get('accounts',{}).get('doubao',[])])
+                manager.archive_unknown_requests(bindings,'已按用户指令清理旧运行；未知提交保留为审计账本')
+                if snap.get('run_id')==run_id:
+                    with runner.store.txn() as data:
+                        if data.get('run_id')!=run_id or [t.get('id') for t in data.get('tasks',[])]!=expected_ids:
+                            return jsonify(error='任务状态在清理期间发生变化；账本已安全归档，请刷新后重试'),409
+                        archived=data.setdefault('archived_runs',[])
+                        if not any(item.get('run_id')==run_id for item in archived):archived.append(archive_entry)
+                        data.update(scripts=[],tasks=[],requests={},assemblies={},run_id='',run_log='',
+                                    run_attempt_id='',run_returncode=None)
+                elif existing and not existing.get('script_files'):
+                    with runner.store.txn() as data:
+                        archived=next((item for item in data.get('archived_runs',[])
+                                       if item.get('run_id')==run_id and item.get('task_ids')==expected_ids),None)
+                        if archived is None:
+                            return jsonify(error='历史归档记录在清理期间发生变化；未删除文件'),409
+                        archived['script_files']=script_paths
+        except RuntimeError as exc:
+            return jsonify(error=f'清理任务失败：{exc}'),409
+        except ValueError as exc:
+            return jsonify(error=str(exc)),409
+        deleted=[];file_errors=[]
+        for value in script_paths:
+            path=Path(value)
+            try:
+                if path.exists():path.unlink();deleted.append(path.name)
+            except OSError as exc:file_errors.append(f'{path.name}: {exc}')
+    return jsonify(ok=True,run_id=run_id,removed_tasks=len(expected_ids),
+                   deleted_script_files=deleted,file_errors=file_errors,
+                   quota_ledger='原始额度凭证已保留并标记为 operator_archived_unknown')
 
 def _savecfg(cfg):
     save_config(cfg,DEFAULT_CONFIG_PATH)
@@ -1090,17 +1362,131 @@ def videos():
         for suffix in ('.mp4','.raw.mp4'):
             labels[str((VIDEOS_DIR/(stem+suffix)).resolve())]=label
     for p in VIDEOS_DIR.glob('*.mp4'):
-        try:s=p.stat()
-        except FileNotFoundError:continue  # A concurrent delete may remove an enumerated file.
         raw=p.name.endswith('.raw.mp4')
         if raw and p.with_name(p.name.removesuffix('.raw.mp4')+'.mp4').is_file():
             continue  # Keep the raw file on disk; show the finished clip once.
+        try:s=p.stat()
+        except FileNotFoundError:continue  # A concurrent delete may remove an enumerated file.
         path=str(p.resolve())
         label=labels.get(path,p.name)
         if raw and path in labels:
             label+='（原始下载）'
         out.append({'name':p.name,'label':label,'path':path,'size':f'{s.st_size/1048576:.1f}MB','modified':datetime.datetime.fromtimestamp(s.st_mtime).isoformat(timespec='seconds'),'postprocess':processed.get(path)})
-    return jsonify(videos=sorted(out,key=lambda x:x['modified'],reverse=True))
+    batches = video_archive.inventory(VIDEOS_DIR)
+    return jsonify(videos=sorted(out,key=lambda x:x['modified'],reverse=True), batches=[
+        dict(id=batch['id'], label=batch['label'], count=len(batch['paths']))
+        for batch in sorted(batches.values(), key=lambda b: (b['label'], b['id']), reverse=True)])
+
+
+def _selected_video_batch():
+    body = request.get_json(silent=True)
+    batch_id = body.get('id') if isinstance(body, dict) else None
+    if not isinstance(batch_id, str) or len(batch_id) > 160:
+        raise ValueError('请指定要操作的视频批次')
+    return video_archive.inventory(VIDEOS_DIR).get(batch_id)
+
+
+@app.post('/api/video-batches/open')
+def open_video_batch():
+    with lock:
+        batch = _selected_video_batch()
+        if not batch:
+            return jsonify(error='批次不存在，请刷新列表'), 404
+        try:
+            folder = video_archive.publish(VIDEOS_DIR, batch['id'], batch['label'], batch['paths'])
+            open_video_folder(folder)
+        except (OSError, ValueError) as exc:
+            return jsonify(error=f'无法打开批次文件夹：{exc}'), 500
+    message = '已请求 Finder 打开批次文件夹' if sys.platform == 'darwin' else '已打开批次文件夹'
+    return jsonify(ok=True, message=message, folder=str(folder))
+
+
+def _delete_batch_files_and_history(batch, journal):
+    batch_id = batch['id']
+    snap = journal.snapshot()
+    active_batch = snap.get('run_id') == batch_id
+    def owns_task(task_id):
+        return video_archive.belongs(batch, str(task_id).replace('#seg', '_seg') + '.mp4')
+
+    task_matches = [owns_task(t.get('id', '')) for t in snap.get('tasks', [])]
+    if (active_batch and not all(task_matches)) or (not active_batch and any(task_matches)):
+        return jsonify(error='此批次仍被当前计划引用，请先结束该计划'), 409
+    # A submitted request can still arrive later or carry a charge. Preserve the
+    # ledger and require reconciliation before deleting its recovery artifacts.
+    accounts = readonly_snapshot(STATE_DIR / 'accounts.json').get('accounts', {})
+    owned_entries = [entry for account in accounts.values() for day in account.get('quota_days', {}).values()
+                     for entry in day.get('entries', {}).values() if owns_task(entry.get('task_id', ''))]
+    if any(entry.get('state') in ('reserved', 'submitted', 'unknown') for entry in owned_entries):
+        return jsonify(error='此批次还有未决请求，请先核对原会话，再删除文件夹'), 409
+
+    requests = {entry.get('request_id') for entry in owned_entries}
+    if active_batch:
+        requests.update(snap.get('requests', {}))
+    directories = []
+    for request_id in requests:
+        if isinstance(request_id, str) and re.fullmatch(r'request_[0-9a-f]{32}', request_id):
+            directory = WORKSPACE.resolve() / 'generation_requests' / request_id
+            if directory.exists():
+                directories.append(video_archive.checked_directory(directory))
+
+    files = set(video_archive.batch_files(VIDEOS_DIR, batch))
+    for base, suffix in ((SCRIPTS_DIR, '.txt'), (FRAMES_DIR, '.png')):
+        for path in base.glob('*' + suffix):
+            if video_archive.belongs(batch, path.name) and video_archive.owned_file(path):
+                files.add(path)
+    log = LOGS_DIR / (batch_id + '.log')
+    if video_archive.owned_file(log):
+        files.add(log)
+
+    folder = video_archive.archive_folder(VIDEOS_DIR, batch_id, batch['label'])
+    with postprocess.store().txn() as data:
+        jobs = data.get('jobs', [])
+        owned = [job for job in jobs
+                 if Path(job['source']).parent == VIDEOS_DIR.resolve()
+                 and video_archive.belongs(batch, Path(job['source']).name)]
+        if any(job['status'] in ('queued', 'running') for job in owned):
+            return jsonify(error='此批次仍有视频正在后处理，完成后才能删除'), 409
+        for job in owned:
+            job_id = job.get('id', '')
+            if re.fullmatch(r'approved_\d{8}_\d{6}_[0-9a-f]{8}', job_id):
+                directory = postprocess.JOBS_DIR.resolve() / job_id
+                if directory.exists():
+                    directories.append(video_archive.checked_directory(directory))
+        # Keep the folder discoverable if a disk operation fails midway.
+        folder.mkdir(parents=True, exist_ok=True)
+        for path in sorted(files):
+            path.unlink(missing_ok=True)
+        for directory in directories:
+            shutil.rmtree(directory)
+        data['jobs'] = [job for job in jobs if job not in owned]
+    with journal.txn() as data:
+        if active_batch:
+            data.update(scripts=[], tasks=[], requests={}, assemblies={}, run_id='', run_log='',
+                        run_attempt_id='', run_returncode=None)
+        data['archived_runs'] = [item for item in data.get('archived_runs', []) if item.get('run_id') != batch_id]
+    shutil.rmtree(video_archive.checked_directory(folder.parent))
+    return jsonify(ok=True, message='已删除批次文件夹、历史记录及对应磁盘文件')
+
+
+@app.post('/api/video-batches/delete')
+def delete_video_batch():
+    with lock:
+        if running():
+            return jsonify(error='流水线仍在运行，请结束运行后再删除批次'), 409
+        runner = Pipeline.__new__(Pipeline)
+        runner.store = store()
+        try:
+            with runner._run_lock():
+                batch = _selected_video_batch()
+                if batch is None:
+                    return jsonify(error='批次不存在，请刷新列表'), 404
+                return _delete_batch_files_and_history(batch, runner.store)
+        except (RuntimeError, ValueError) as exc:
+            return jsonify(error=str(exc)), 409
+        except PermissionError:
+            return jsonify(error='部分批次文件无法删除，请关闭占用文件的窗口后重试'), 409
+        except OSError as exc:
+            return jsonify(error=f'批次文件未完全清理，请重试：{exc}'), 500
 
 @app.post('/api/videos/approve')
 def approve_video():
@@ -1116,7 +1502,10 @@ def delete_video():
             return jsonify(error='视频生成流程仍在使用下载文件，请等待运行完成后再删除'),409
         p=video_path(request.get_json(force=True).get('path',''))
         try:
+            copy_path = video_archive.archived_copy(VIDEOS_DIR, p)
             deleted=postprocess.delete_source(p)
+            if copy_path is not None:
+                copy_path.unlink(missing_ok=True)
         except postprocess.VideoInUse as exc:
             return jsonify(error=str(exc)),409
         except PermissionError:
@@ -1180,6 +1569,10 @@ if __name__=='__main__':
     # Resume already queued postprocessing only during service startup, never from a GET.
     if os.environ.get('DOUBAO_CONTAINER_PREVIEW') != '1':
         postprocess.busy()
+        try:
+            video_archive.backfill(VIDEOS_DIR)
+        except (OSError, ValueError):
+            app.logger.exception('历史视频归档未完成；可通过打开对应批次重试')
     # Windows 上 Werkzeug 的地址重用会允许多个仪表盘同时监听相同端口。
     from werkzeug.serving import BaseWSGIServer
     BaseWSGIServer.allow_reuse_address=False

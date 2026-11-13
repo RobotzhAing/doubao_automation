@@ -14,7 +14,8 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .config import get
-from .doubao_batch import BatchGenerationMixin, quota_exhaustion_matches
+from .doubao_batch import (BatchGenerationMixin, generation_unavailable_matches,
+                           quota_exhaustion_matches)
 
 
 class NeedsLogin(Exception):
@@ -49,6 +50,7 @@ def _combine(selectors) -> str:
 # Only explicit daily video-generation exhaustion qualifies; ambiguous failures do not.
 DEFAULT_QUOTA_EXHAUSTED_PATTERNS = [
     r'(?:今日|今天|当日)(?:的)?(?:免费)?视频(?:生成)?(?:次数|额度)(?:已|已经)(?:用完|耗尽)',
+    r'(?:今日|今天|当日)(?:的)?视频(?:生成)?免费(?:次数|额度)(?:已|已经)(?:用完|耗尽)',
     r'(?:daily|today\x27s)\s+(?:free\s+)?video\s+generation\s+(?:quota|limit)\s+(?:has\s+been\s+)?(?:exhausted|reached)',
     r'no\s+(?:daily\s+)?(?:free\s+)?video\s+generations\s+(?:are\s+)?remaining',
 ]
@@ -224,6 +226,22 @@ class DoubaoAgent(BatchGenerationMixin):
         self._assert_logged_in()
         self._wait_chat_ready(fresh=False)
 
+    def _input_box(self):
+        configured = self.sel.get('input_box') or []
+        configured = [configured] if isinstance(configured, str) else list(configured)
+        selectors = [s for s in configured if isinstance(s, str) and s.strip()]
+        selectors.extend(('[contenteditable="true"]', 'textarea', '[role="textbox"]'))
+        for selector in dict.fromkeys(selectors):
+            try:
+                boxes = self.page.locator(selector)
+                for index in range(boxes.count()):
+                    box = boxes.nth(index)
+                    if box.is_visible() and box.is_enabled():
+                        return box
+            except Exception:
+                continue
+        return None
+
     def _chat_ready(self, fresh=False):
         """A root URL alone can precede hydration of the previous conversation."""
         url = urlsplit(self.page.url)
@@ -231,10 +249,7 @@ class DoubaoAgent(BatchGenerationMixin):
             return False
         if fresh and not self._fresh_chat_route(self.page.url):
             return False
-        boxes = self.page.locator(_combine(self.sel.get('input_box')) or
-                                  '[contenteditable="true"], textarea, [role="textbox"]')
-        if not any(boxes.nth(i).is_visible() and boxes.nth(i).is_enabled()
-                   for i in range(boxes.count())):
+        if self._input_box() is None:
             return False
         if fresh:
             history = self.page.locator(
@@ -364,21 +379,36 @@ class DoubaoAgent(BatchGenerationMixin):
         """只输入不发送（供 dry-run 校准用）。"""
         page = self.page
         self._handle_dialogs()
-        box = _combine(self.sel.get("input_box"))
-        loc = page.locator(box).first
+        loc = self._input_box()
+        if loc is None:
+            raise GenerationFailed(f'[{self.name}] 找不到可用对话输入框，未输入或发送')
         loc.click(timeout=8000)
         page.wait_for_timeout(200)
         page.keyboard.insert_text(text)
         page.wait_for_timeout(600)
 
     def send(self) -> bool:
-        """点击发送按钮；找不到按钮时按 Enter 兜底。返回是否用按钮发送。"""
+        """Click a configured or semantic send control; Enter remains a last resort.
+
+        The caller separately verifies that the exact user message appears in the
+        conversation before treating this action as a successful submission.
+        """
         page = self.page
         self._handle_dialogs()
-        for sel in (self.sel.get("send_button") or []):
+        configured = self.sel.get('send_button') or []
+        configured = [configured] if isinstance(configured, str) else list(configured)
+        selectors = configured + [
+            'button[data-testid*="send" i]', '[role="button"][data-testid*="send" i]',
+            'button[aria-label*="发送"]', '[role="button"][aria-label*="发送"]',
+            'button[aria-label*="Send" i]', '[role="button"][aria-label*="Send" i]',
+        ]
+        for sel in dict.fromkeys(selectors):
             try:
-                btn = page.locator(sel).first
-                if btn.count() > 0 and btn.is_visible():
+                matches = page.locator(sel)
+                for i in range(matches.count()):
+                    btn = matches.nth(i)
+                    if not btn.is_visible():
+                        continue
                     if not btn.is_enabled():
                         raise GenerationFailed('发送按钮尚未就绪，未触发发送')
                     try:
@@ -386,7 +416,7 @@ class DoubaoAgent(BatchGenerationMixin):
                     except Exception as exc:
                         self._handle_dialogs()
                         raise GenerationFailed('发送按钮操作结果未确认，已停止重复点击或回车重发') from exc
-                    page.wait_for_timeout(1500)
+                    page.wait_for_timeout(500)
                     self._handle_dialogs()
                     return True
             except (NeedsUserAction, GenerationFailed):
@@ -399,10 +429,64 @@ class DoubaoAgent(BatchGenerationMixin):
         self._handle_dialogs()
         return False
 
+    @staticmethod
+    def _normalize_message_text(text):
+        return ' '.join(re.sub(r'[\u200b\ufeff]', '', text or '').split())
+
+    def _user_message_texts(self):
+        selectors = self.sel.get('user_message') or []
+        selectors = [selectors] if isinstance(selectors, str) else list(selectors)
+        selectors.extend((
+            '[data-testid="send_message"]', '[data-testid="user_message"]',
+            '[data-message-role="user"]', '[data-role="user"]',
+        ))
+        selector = ','.join(dict.fromkeys(s for s in selectors if isinstance(s, str) and s.strip()))
+        if not selector:
+            return []
+        try:
+            return self.page.evaluate('''selector => [...document.querySelectorAll(selector)]
+              .filter(e => e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden')
+              .map(e => e.innerText || e.textContent || '')''', selector)
+        except Exception:
+            return []
+
+    def _composer_text(self):
+        try:
+            box = self._input_box()
+            if box is not None:
+                return box.evaluate('e => String(e.value ?? e.innerText ?? e.textContent ?? "")')
+        except Exception:
+            pass
+        return ''
+
+    def _wait_for_user_message(self, text, previous_matches):
+        try:
+            timeout = float(self.dcfg.get('send_confirmation_timeout_seconds', 12))
+            if not 0 < timeout <= 60:
+                raise ValueError
+        except (TypeError, ValueError):
+            timeout = 12
+        expected = self._normalize_message_text(text)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            messages = self._user_message_texts()
+            matches = sum(expected in self._normalize_message_text(message) for message in messages)
+            if matches > previous_matches:
+                return
+            self.page.wait_for_timeout(100)
+        draft = self._normalize_message_text(self._composer_text())
+        state = '草稿仍在输入框' if draft else '输入框已清空但会话消息未出现'
+        raise GenerationFailed(
+            f'[{self.name}] 发送动作后未观察到本条用户消息（{state}）；已停止重试，避免重复提交')
+
     def type_and_send(self, text: str):
+        expected = self._normalize_message_text(text)
+        previous_matches = sum(expected in self._normalize_message_text(message)
+                               for message in self._user_message_texts())
         self.type_text(text)
         by_button = self.send()
-        print(f"[{self.name}] 已触发发送（{len(text)} 字，按钮发送={by_button}），等待平台接受确认…", flush=True)
+        self._wait_for_user_message(text, previous_matches)
+        print(f"[{self.name}] 已确认本条消息进入对话（{len(text)} 字，按钮发送={by_button}），等待平台回复…", flush=True)
 
     # ---- 结果监控 ----
     def _recent_text(self) -> str:
@@ -543,6 +627,15 @@ class DoubaoAgent(BatchGenerationMixin):
             except Exception:
                 page_text = text
             text = text or page_text[-6000:]
+            try:
+                assistant_reply = self._assistant_text()
+            except Exception:
+                assistant_reply = ''
+            if (getattr(self, '_last_reply_source', '') == 'latest_assistant'
+                    and assistant_reply and assistant_reply != getattr(self, '_quota_assistant_before', None)
+                    and not any(k in assistant_reply for k in ACTIVE_KEYWORDS)
+                    and generation_unavailable_matches(assistant_reply)):
+                raise GenerationFailed(f"[{self.name}] 豆包明确表示无法执行视频渲染；没有生成视频产物")
             # 长时间无任何新内容且未进入生成流程 → 快速失败重试
             if (self._video_count() == baseline_videos
                     and not any(k in text for k in ACTIVE_KEYWORDS)

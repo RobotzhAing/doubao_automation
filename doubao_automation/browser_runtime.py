@@ -1,4 +1,5 @@
 """Resolve installed browser executables without opening a browser or profile."""
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -29,6 +30,17 @@ def resolve_browser_runtime(cfg, managed_executable, *, platform=None):
         return result
     channel = configured.strip().lower() if explicit else ('chrome' if platform == 'win32' else None)
     if channel in ('', 'chromium'):
+        channel = None
+    if platform == 'win32' and channel == 'chrome':
+        chrome = next((path for key in ('PROGRAMFILES', 'PROGRAMFILES(X86)', 'LOCALAPPDATA')
+                       if (base := os.environ.get(key))
+                       and (path := Path(base) / 'Google/Chrome/Application/chrome.exe').is_file()), None)
+        if chrome:
+            result.update(available=True, channel='chrome', executable=str(chrome), source='system-chrome')
+            return result
+        if explicit:
+            result.update(channel='chrome', error='配置要求 Chrome，但未找到安装。请安装 Chrome 或将 browser.channel 改为 chromium。')
+            return result
         channel = None
     if channel:
         result.update(channel=channel, source='configured-channel' if explicit else 'default-channel',

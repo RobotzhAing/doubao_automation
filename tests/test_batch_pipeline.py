@@ -94,6 +94,13 @@ class FakeAgent:
                         error_kind='quota',error='Latest assistant quota response',
                         continuation_safe=quota_mode=='quota_reject_a')
 
+        if h.mode=='not_generated':
+            evidence=dict(kind='generation_unavailable',definitive=True,active=False,
+                          source='latest_assistant',video_asset_found=False)
+            return dict(videos={},remote_refs={},unresolved=ids,submitted=True,chat_url=chat_url,
+                        error_kind='not_generated',error='Provider explicitly declined video rendering',
+                        rejection_evidence=evidence,continuation_safe=True)
+
         if h.mode in ('unknown','empty_refs'):
             return dict(videos={}, remote_refs={tid:{} for tid in ids} if h.mode=='empty_refs' else {}, unresolved=ids, submitted=True,
                         chat_url=chat_url, error_kind='timeout', error='Result not yet reconciled',
@@ -315,6 +322,25 @@ class BatchPipelineTests(unittest.TestCase):
         self.assertEqual([(request['account'], request['phase']) for request in requests],
                          [('a', 'cancelled'), ('b', 'complete')])
 
+    def test_transient_chat_startup_failure_does_not_disable_enabled_account(self):
+        self.plan([('script15', [15])])
+
+        class ComposerNotReadyAgent(FakeAgent):
+            def open_chat(self):
+                if self.name == 'a':
+                    raise module.GenerationFailed('composer not ready yet')
+
+        with patch.object(module, 'DoubaoAgent',
+                          side_effect=lambda _session, _cfg, name: ComposerNotReadyAgent(self.h, name)):
+            self.pipeline.stage_run()
+
+        self.assertEqual(self.h.opened, ['a', 'b'])
+        self.assertEqual(self.h.sent, 1)
+        self.assertEqual(self.pipeline.accounts.status('a')['status'], 'available')
+        self.assertEqual(self.pipeline.accounts.quota('a')['reserved'], 0)
+        self.assertEqual(self.pipeline.store.snapshot()['tasks'][0]['status'], 'done')
+        self.assertEqual(self.pipeline.store.snapshot()['tasks'][0]['account'], 'b')
+
     def test_submitted_definitive_quota_refusal_continues_on_next_account(self):
         self.plan([('script30',[15,15])])
         self.h.mode='quota_reject_a'
@@ -345,6 +371,23 @@ class BatchPipelineTests(unittest.TestCase):
         self.assertEqual(self.pipeline.accounts.quota('a')['unknown'],2)
         self.assertTrue(all(t['account']=='a' for t in self.pipeline.store.snapshot()['tasks']))
         self.assertEqual(self.pipeline.accounts.quota('b')['used'],0)
+
+    def test_explicit_no_render_reply_releases_quota_without_repeating_in_same_run(self):
+        self.plan([('script15',[15])])
+        self.h.mode='not_generated'
+        batch=self.pipeline._claim_batch('a');rid=batch[0]['request_id'];task_id=batch[0]['id']
+        self.pipeline._local_blocked_tasks=set()
+        self.assertTrue(self.pipeline._execute_batch(FakeAgent(self.h,'a'),'a',batch))
+        task=self.pipeline.store.snapshot()['tasks'][0]
+        request=self.pipeline.store.snapshot()['requests'][rid]
+        quota=self.pipeline.accounts.quota('a')
+        entry=self.pipeline.accounts.request('a',rid)['entries'][task_id]
+        self.assertEqual((task['status'],task['request_id'],task['failure_phase']),
+                         ('pending','','provider_unavailable'))
+        self.assertEqual((quota['reserved'],quota['unknown'],quota['remaining']),(0,0,4))
+        self.assertEqual(entry['state'],'rejected')
+        self.assertEqual(request['phase'],'not_generated')
+        self.assertIsNone(self.pipeline._claim_batch('a'))
 
     def test_charged_download_failure_is_not_released_with_other_refused_slot(self):
         self.plan([('script30',[15,15])])

@@ -47,6 +47,23 @@ class DurationControlTests(unittest.TestCase):
         self.assertEqual(self.page.get_by_role('button', name='9:16 · 15s').count(), 1)
         self.assertIsNone(self.page.get_by_role('button', name='视频生成').get_attribute('data-clicked'))
 
+    def test_skill_menu_layout_opens_video_generation_before_selecting_duration(self):
+        self.page.set_content('<button id="skills">技能 ›</button><div id="video-menu"></div>'
+                              '<div id="video-controls"></div>')
+        self.page.evaluate('''() => document.body.addEventListener('click', event => {
+          if (event.target.id === 'skills') {
+            event.target.dataset.clicked = '1';
+            document.querySelector('#video-menu').innerHTML = '<button id="video">视频生成</button>';
+          } else if (event.target.id === 'video') {
+            event.target.dataset.clicked = '1';
+            document.querySelector('#video-controls').innerHTML = '<button>9:16 · 15s</button>';
+          }
+        })''')
+        ControlAgent(self.page).configure_video_mode()
+        self.assertEqual(self.page.locator('#skills').get_attribute('data-clicked'), '1')
+        self.assertEqual(self.page.locator('#video-menu #video').get_attribute('data-clicked'), '1')
+        self.assertEqual(self.page.get_by_role('button', name='9:16 · 15s').count(), 1)
+
     def test_nondefault_duration_uses_real_slider_index_before_returning(self):
         self.page.set_content('''
           <button id="duration" onclick="document.querySelector('section').hidden=false">自动 · 8s</button>

@@ -7,6 +7,7 @@ import time
 import traceback
 import uuid
 import os
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -24,8 +25,10 @@ from .paths import (FRAMES_DIR, ROOT, SCRIPTS_DIR, STATE_DIR, VIDEOS_DIR,
 from .script_splitter import build_segments, parse_scripts, detect_total_seconds
 from .state import JsonStore
 from .video_utils import concat_videos, extract_last_frame, find_ffmpeg
+from .video_archive import publish_finished
 
 _INITIAL = {"products": [], "sources": [], "fixed_prompt": "", "scripts": [], "tasks": []}
+_QUOTA_TIMEZONE = timezone(timedelta(hours=8), 'Asia/Shanghai')
 
 
 def _valid_remote_ref(value):
@@ -77,6 +80,7 @@ class Pipeline:
         self._attempted_requests = set()
         self._local_attempts_this_run = {}
         self._local_blocked_tasks = set()
+        self.recovery_request_ids = []
 
     # ================= Stage 1: 飞书 =================
     def stage_fetch(self, force: bool = False):
@@ -352,6 +356,75 @@ class Pipeline:
                 for tid in request.get('original_task_ids',request.get('task_ids',[])):item(tid)['submitted']=True
         return history
 
+    def _restore_approved_ledger_requests(self,data):
+        """Rebuild only explicitly selected, single-video submitted tasks."""
+        selected=list(dict.fromkeys(getattr(self,'recovery_request_ids',[]) or []))
+        if not selected:
+            return
+        if data.get('tasks'):
+            raise RuntimeError('恢复请求清单只能用于任务日志丢失的状态；原任务未修改')
+        ledger=self.accounts.store.snapshot().get('accounts',{})
+        found=[]
+        for account in self.account_names:
+            acc=ledger.get(account,{})
+            for request_id in selected:
+                saved=acc.get('quota_requests',{}).get(request_id)
+                if not saved:
+                    continue
+                task_ids=saved.get('task_ids',[])
+                if (saved.get('submitted') is not True or len(task_ids)!=1
+                        or not isinstance(task_ids[0],str) or not task_ids[0].endswith('#seg0')):
+                    continue
+                entries={}
+                for day in acc.get('quota_days',{}).values():
+                    for entry in day.get('entries',{}).values():
+                        if entry.get('request_id')==request_id:
+                            entries[entry.get('task_id')]=entry
+                if entries.get(task_ids[0],{}).get('state') not in ('submitted','unknown'):
+                    continue
+                chat_path=formal_doubao_chat_path(saved.get('chat_url',''))
+                baseline=saved.get('baseline') or {}
+                ownership=baseline.get('ownership') or {}
+                try:
+                    proof=BatchGenerationMixin._original_anchor_proof(ownership,chat_path)
+                except (TypeError,ValueError):
+                    continue
+                approvals=[control for control in baseline.get('controls',[])
+                           if isinstance(control,dict) and control.get('phase')=='operator_approved_resume'
+                           and control.get('task_ids')==task_ids]
+                if (not chat_path or baseline.get('scope_version')!=1
+                        or baseline.get('ownership_acknowledged') is not True
+                        or ownership.get('chat_path')!=chat_path
+                        or ownership.get('marker')!=f'【自动化任务标记：{request_id}】'
+                        or ownership.get('original_anchor_proof')!=proof or not approvals):
+                    continue
+                duration=detect_total_seconds(ownership.get('prompt',''))
+                if duration is None or not 0<float(duration)<=15:
+                    continue
+                task_id=task_ids[0]
+                script_id=task_id.rsplit('#seg',1)[0]
+                task=dict(id=task_id,script_id=script_id,seg_index=0,seg_total=1,
+                          prompt='',narration='',est_seconds=float(duration),target_seconds=float(duration),
+                          start_seconds=0,end_seconds=float(duration),product_images=[],status='awaiting_result',
+                          account=account,attempts=1,cloud_attempts=1,local_attempts=0,video='',error='',
+                          request_id=request_id,raw_video='',remote_ref={})
+                request=dict(request_id=request_id,account=account,task_ids=list(task_ids),
+                             original_task_ids=list(task_ids),script_id=script_id,phase='unknown',
+                             submitted=True,chat_url=saved.get('chat_url',''),
+                             baseline=baseline,continuation_safe=False)
+                found.append((request_id,task,request))
+        if {item[0] for item in found}!=set(selected) or len(found)!=len(selected):
+            raise RuntimeError('部分原请求缺少有效的提交账本或原会话证明；未恢复任何新生成任务')
+        tasks=[item[1] for item in found]
+        if len({task['id'] for task in tasks})!=len(tasks):
+            raise RuntimeError('恢复请求包含重复任务编号；未修改原任务')
+        data['tasks']=tasks
+        requests=data.setdefault('requests',{})
+        for request_id,_,request in found:
+            if request_id in requests:
+                raise RuntimeError('流水线日志与额度账本对同一请求存在冲突；未恢复')
+            requests[request_id]=request
+
     @staticmethod
     def _retry_counts(task,history,refund_gap=False):
         local=len(history.get('cancelled',()))
@@ -362,6 +435,7 @@ class Pipeline:
     def _recover_state(self):
         """Repair the journal/ledger gap without ever converting an uncertain send into a new send."""
         with self.store.txn() as data:
+            self._restore_approved_ledger_requests(data)
             requests=data.setdefault('requests',{})
             history=self._task_retry_history(requests)
             for task in data.get('tasks',[]):
@@ -536,7 +610,16 @@ class Pipeline:
         if task['seg_index']+1<task['seg_total']:
             frame=FRAMES_DIR/f"{task['script_id']}_seg{task['seg_index']}_end.png"
             extract_last_frame(dest,frame,self.ffmpeg,float(get(self.cfg,'video.tail_frame_offset_seconds',0.3)))
+        self._publish_archive_video(dest)
         self._finish(task['id'],status='done',video=str(dest),raw_video=str(raw),error='',tail_ready=True)
+
+    @staticmethod
+    def _publish_archive_video(path):
+        try:
+            publish_finished(VIDEOS_DIR, path)
+        except (OSError, ValueError) as exc:
+            # The library can rebuild the folder from the verified source.
+            print(f'[归档] {path.name} 暂未加入批次文件夹：{exc}', flush=True)
 
     def _assemble_all(self):
         snap=self.store.snapshot();tasks=snap.get('tasks',[])
@@ -557,6 +640,7 @@ class Pipeline:
             except Exception as exc:
                 with self.store.txn() as data:data['assemblies'][sid].update(status='failed',error=str(exc)[:500])
             else:
+                self._publish_archive_video(out)
                 with self.store.txn() as data:data['assemblies'][sid].update(status='done',error='')
 
     def _late_result_tasks(self, account, rid, request, ledger):
@@ -638,6 +722,13 @@ class Pipeline:
                                                if _valid_remote_ref(t.get('remote_ref'))},resume_only=submitted)
         if recovering:
             context['recovery_timeout_seconds'] = recovery_timeout_seconds
+        elif (submitted and request.get('phase') == 'unknown'
+              and request.get('error_kind') in ('timeout', 'download')):
+            # A persisted unknown result must be checked in its original chat,
+            # but a long generation timeout here serially starves every later
+            # account in stage_run(). Keep this as a bounded, read-only resume;
+            # run_batch() sees resume_only and can never resend the prompt.
+            context['recovery_timeout_seconds'] = 45
         dests={t['id']:VIDEOS_DIR/f"{t['script_id']}_seg{t['seg_index']}.raw.mp4" for t in tasks}
 
         def on_quota_remaining(count):
@@ -648,14 +739,22 @@ class Pipeline:
                 if q['used']+q['reserved']+q['unknown']>q['limit']:
                     raise GenerationFailed('平台余额少于本批次，请先释放预留再缩小批次')
 
-        if not recovering:
+        if not submitted:
             context['on_quota_remaining']=on_quota_remaining
 
         def on_submitted(chat_url,baseline):
             if recovering:
                 if formal_doubao_chat_path(chat_url) != recovery_path:
                     raise ValueError('短时回查期间原会话地址改变')
-                return  # The existing binding already records this submission.
+                # Persist a directly observed operator confirmation in both
+                # journals so a later recovery can reuse its exact turn.
+                self.accounts.mark_submitted(account,rid,chat_url=chat_url,baseline=baseline)
+                with self.store.txn() as data:
+                    saved=data['requests'].get(rid)
+                    if not saved or formal_doubao_chat_path(saved.get('chat_url')) != recovery_path:
+                        raise ValueError('短时回查期间原请求绑定发生变化')
+                    saved['baseline']=baseline
+                return
             self.accounts.mark_submitted(account,rid,chat_url=chat_url,baseline=baseline)
             with self.store.txn() as data:
                 data['requests'][rid].update(phase='submitted',submitted=True,chat_url=chat_url,baseline=baseline)
@@ -729,7 +828,7 @@ class Pipeline:
                         if task['id'] in unresolved:
                             task.update(status='needs_user',failure_phase='before_accept',error=error)
                 return False
-        refunded=[]
+        refunded=[];not_generated_released=[]
         if not recovering and submitted and kind=='partial_failed_refunded' and result.get('continuation_safe') is True:
             # A failed slot remains its original slot; never infer it from the number/order of successes.
             try:
@@ -776,14 +875,41 @@ class Pipeline:
                 with self.store.txn() as data:data['requests'][rid]['phase']='rejected'
                 self.accounts.mark_exhausted(account,error)
                 return False
-        if submitted:
+        if not recovering and submitted and kind=='not_generated' and result.get('continuation_safe') is True:
+            try:
+                evidence=result.get('rejection_evidence')
+                not_generated_released=self.accounts.release_not_generated(account,rid,unresolved,evidence)
+            except ValueError as exc:
+                with self.store.txn() as data:data['requests'][rid]['rejection_error']=str(exc)
+            if not_generated_released:
+                max_attempts=max(1,int(get(self.cfg,'doubao.max_attempts_per_task',3)))
+                with self.store.txn() as data:
+                    saved=data['requests'][rid]
+                    saved.setdefault('original_task_ids',list(saved.get('task_ids',[])))
+                    saved['not_generated_task_ids']=sorted(set(saved.get('not_generated_task_ids',[]))
+                                                           |set(not_generated_released))
+                    saved['task_ids']=[tid for tid in saved.get('task_ids',[]) if tid not in not_generated_released]
+                    saved['rejection_evidence']=evidence
+                    for task in data['tasks']:
+                        if task['id'] not in not_generated_released:continue
+                        attempts=int(task.get('cloud_attempts',task.get('attempts',0)))+1
+                        blocked=attempts>=max_attempts
+                        task.update(status='failed' if blocked else 'pending',attempts=attempts,
+                                    cloud_attempts=attempts,account='',request_id='',remote_ref={},raw_video='',
+                                    failure_phase='provider_unavailable',error=error or '平台未执行视频渲染')
+                        if not blocked:
+                            self._local_blocked_tasks=getattr(self,'_local_blocked_tasks',set())
+                            self._local_blocked_tasks.add(task['id'])
+                    if not saved['task_ids']:saved['phase']='not_generated'
+                unresolved=[tid for tid in unresolved if tid not in not_generated_released]
+        if submitted and unresolved:
             self.accounts.mark_unknown(account,rid,task_ids=unresolved,note=error)
             with self.store.txn() as data:
                 data['requests'][rid].update(phase='unknown',submitted=True)
                 for task in data['tasks']:
                     if task['id'] in unresolved and not task.get('raw_video'):
                         task.update(status='needs_user' if kind in ('needs_user','user_approval') else 'awaiting_result',error=error)
-        else:
+        elif not submitted:
             self.accounts.release_unsubmitted(account,rid)
             local_counts=getattr(self,'_local_attempts_this_run',{})
             local_blocked=getattr(self,'_local_blocked_tasks',set())
@@ -803,6 +929,7 @@ class Pipeline:
         if kind=='quota' and not recovering:self.accounts.mark_exhausted(account,error)
         elif kind=='login':self.accounts.mark_needs_login(account,error)
         return ((bool(refunded) and not self.accounts.quota(account)['unknown'])
+                or bool(not_generated_released)
                 or (not submitted and kind not in ('quota','login')))
 
     def _execute(self,agent,account,task):
@@ -856,7 +983,7 @@ class Pipeline:
             traceback.print_exc()
             if not opened:
                 self._release_startup_reservation(name,batch,str(exc))
-                self.accounts.mark_disabled(name,str(exc)[:300])
+                self.accounts.mark_startup_retryable(name,str(exc)[:300])
             self.accounts.release(name)
         finally:session.stop()
 
@@ -877,6 +1004,73 @@ class Pipeline:
         require_doubao_accounts(self.cfg)
         with self._run_lock():
             return self._stage_run_locked()
+
+    @staticmethod
+    def _seconds_until_quota_reset(now=None):
+        """Seconds until the next account-quota day in the ledger's timezone."""
+        now = now or datetime.now(_QUOTA_TIMEZONE)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=_QUOTA_TIMEZONE)
+        local_now = now.astimezone(_QUOTA_TIMEZONE)
+        next_day = local_now.date() + timedelta(days=1)
+        reset = datetime.combine(next_day, datetime_time.min, tzinfo=_QUOTA_TIMEZONE)
+        return max(1.0, (reset - local_now).total_seconds() + 1.0)
+
+    def _can_wait_for_quota_reset(self):
+        """Wait only when unfinished work is cleanly pending solely on daily quota."""
+        snap = self.store.snapshot()
+        tasks = snap.get('tasks', [])
+        pending = [task for task in tasks if task.get('status') == 'pending']
+        if not pending or any(task.get('status') not in ('pending', 'done') for task in tasks):
+            return False
+        pending_ids = {task.get('id') for task in pending}
+        if any(task.get('request_id') for task in pending):
+            return False
+        for request in snap.get('requests', {}).values():
+            if request.get('phase') in ('reserved', 'submitted', 'unknown', 'downloading') and any(
+                    task_id in pending_ids for task_id in request.get('task_ids', [])):
+                return False
+
+        runnable_accounts = 0
+        for account in self.account_names:
+            status = self.accounts.status(account).get('status')
+            quota = self.accounts.quota(account)
+            if status not in ('available', 'exhausted'):
+                continue
+            if quota.get('pending_recovery') or quota.get('unknown') or quota.get('awaiting_approval'):
+                continue
+            runnable_accounts += 1
+            if quota.get('remaining', 0) > 0:
+                return False
+        return runnable_accounts > 0
+
+    def _wait_for_next_quota_day(self):
+        delay = self._seconds_until_quota_reset()
+        hours, remainder = divmod(int(delay), 3600)
+        minutes = remainder // 60
+        print(f'[resume] 剩余任务仅因当日额度耗尽而待执行；将在北京时间次日额度日切换后续跑 '
+              f'（约 {hours} 小时 {minutes} 分钟）。任务和请求账本保持不变。', flush=True)
+        time.sleep(delay)
+
+    def stage_run_waiting_for_quota_reset(self):
+        """Keep the saved run alive across quota-day boundaries until it completes."""
+        require_doubao_accounts(self.cfg)
+        # Keep the same process lock across sleep and retries so a dashboard or
+        # independent CLI cannot start a second runner while this one is idle.
+        with self._run_lock():
+            while True:
+                # Check before entering the worker loop. This keeps a resumed
+                # process idle while every account is still at zero quota.
+                if self._can_wait_for_quota_reset():
+                    self._wait_for_next_quota_day()
+                    continue
+                try:
+                    return self._stage_run_locked()
+                except RuntimeError as exc:
+                    if (not str(exc).startswith('流程未完成：')
+                            or not self._can_wait_for_quota_reset()):
+                        raise
+                    self._wait_for_next_quota_day()
 
     def _recover_late_results(self):
         """Give each eligible request one readback after the normal account pass."""

@@ -42,7 +42,7 @@ Apple Silicon Mac 已完成视频生成主流程的实机验证；第三方审�
 
 ## 平台入口
 
-- **Windows**：安装 Python、将完整 FFmpeg（含 FFprobe）加入 PATH，创建 `.venv` 并安装依赖，然后双击 `scripts/start_windows.bat`。登录状态和任务数据使用 Windows 本机数据目录。
+- **Windows**：先安装 Python 3.10+ 和完整 FFmpeg（含 FFprobe）并加入 PATH，然后双击 `scripts/start_windows.bat`。登录状态和任务数据使用 Windows 本机数据目录。
 - **macOS（Apple Silicon）**：先安装 Python 3.10+ 和完整 FFmpeg（含 FFprobe），再双击根目录 `start_mac.command` 或 `scripts/start_macos.command`；两者使用同一原生流程，自动准备缺失的虚拟环境、依赖及可用浏览器，**无需 Docker**。私有配置按需初始化且不覆盖。详见 [Mac 安装与启动指南](docs/macos.md)。Intel Mac 尚未实机验证。
 - **关闭与历史清理**：`scripts/stop_windows.bat`、`scripts/stop_macos.command` 目前会明确提示安全关闭尚未支持，不终止进程。两个 `clear_history` 入口和工作台按钮目前仅提供保守预览，不删除记录或文件；需要先完成原子关停、引用核验和恢复机制才能支持实际操作。以上入口均尚未实测。
 - **Docker**：Linux Web/API 预览与 Mac 原生运行分开，见 [Docker 说明](docs/docker.md)；不包括浏览器和后处理能力，镜像访问权限需单独核实。
@@ -57,7 +57,7 @@ Windows 双击 `start_dashboard.bat`；Mac 双击 `start_mac.command`。启动�
 - “同步飞书”从远端读取素材；“保存修改”写入本地状态，不回写飞书。运行使用已保存素材，不会重新同步覆盖修改。
 - 素材行的“删除”只移出当前列表；普通“同步飞书”会恢复远端仍存在且成功导入的记录。产品图库与素材列表独立显示，同步统计说明空行、缺少附件等跳过情况。
 - 脚本数量根据素材提示词及 Gemini 返回的脚本确定。操作消息与实时运行日志分别显示，失败时会显示未完成。
-- 已下载视频的“打开文件”在浏览器直接播放，支持拖动进度；“打开文件夹”请求 Windows 打开视频目录，按钮旁显示请求结果或系统错误。
+- 「已下载视频」按任务启动时间显示批次；可打开只含成片的文件夹，或确认后删除本批成片、原始下载、校验文件和历史记录。
 - 当前成片显示脚本与片段序号；对应成片存在时不重复列出 raw 下载，原文件仍保留。
 - 每行的“删除”经确认后会删除该行原始 MP4 的磁盘文件，列表随即移除该视频；排队或后处理中的视频暂不能删除。
 - 添加豆包账号后会打开独立浏览器，需要人工登录。新账号在登录验证成功前不会进入运行账号池；可关闭登录窗口后使用其他已登录账号运行。
@@ -82,25 +82,13 @@ Windows 桌面助手与 macOS Finder 操作是不同的平台路径：Windows �
 **本发布副本不包含 video-subtitle-remover、RapidOCR、后处理适配器或模型权重**，因此审核后的去水印与 SeedVR2 超分功能尚不能运行；未经 PATH-only FFmpeg 验证的第三方适配器会被拒绝，补装模型本身无法启用。ComfyUI 需由使用者独立部署，节点、模型和 GPU 兼容性仍需验证。视频生成完成不代表审核后处理已完成，也不保证提示词所写的 4K/60fps 或无水印规格。
 命令行使用工作台已保存素材：`python run_pipeline.py all --from-saved --force`。普通 `all --force` 仍会重新同步飞书。
 
-以下环境准备命令面向 Windows；Mac 的首次准备由原生入口执行，见 [Mac 指南](docs/macos.md)。
-
-```powershell
-python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
-# 使用系统 Chrome（推荐，无需下载浏览器）；若没有 Chrome 才需要:
-# python -m playwright install chromium
-```
+两端启动器会自动建立虚拟环境、安装 Python 依赖、准备浏览器并初始化缺失的配置模板，无需 Docker。首次准备需要联网。Windows 可使用 winget install Gyan.FFmpeg 安装 FFmpeg；macOS 可使用 brew install ffmpeg。建议使用 Python 3.12。下载 ZIP 后先完整解压；若 macOS 未保留执行权限，在项目目录运行 sh start_mac.command。
 
 ## 飞书应用配置（一次性）
 
 同步需要使用者自己的私有配置，下载源码后不会自动携带任何飞书账号、密钥或提示词。请勿把 `config/config.yaml`、固定提示词或 Cookie 上传到 GitHub。
 
-Windows 在项目目录下执行以下命令准备配置；如果文件已存在，请保留原文件并手动编辑，不要覆盖：
-
-```powershell
-if (-not (Test-Path config/config.yaml)) { Copy-Item config/config.example.yaml config/config.yaml }
-notepad config/config.yaml
-```
+Windows 首次双击后会创建 config/config.yaml，可用记事本填写；已有配置不会覆盖。
 
 macOS 启动器会按 [Mac 配置说明](docs/macos.md#数据目录与私有配置)初始化缺失模板，并打印实际配置路径；已有私有配置不覆盖。若设置了 `DOUBAO_DATA_DIR` 或 `DOUBAO_CONFIG_PATH`，请编辑该设置对应的本机配置，而不是修改示例文件。
 

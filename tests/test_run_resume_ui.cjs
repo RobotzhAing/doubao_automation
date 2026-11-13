@@ -7,7 +7,7 @@ function element(selector){
   return elements.get(selector);
 }
 const calls=[];
-let state={rows:[{record_id:'fixture',keyword:'product',prompt:'saved',videos:[],images:[]}],requested_script_count:2,resume_script_count:2,can_resume:true,running:false,returncode:null};
+let state={rows:[{record_id:'fixture',keyword:'product',prompt:'saved',videos:[],images:[]}],requested_script_count:2,resume_script_count:2,can_resume:true,recovery_request_ids:['request-a','request-b'],running:false,returncode:null};
 let failStart=false;
 const context=vm.createContext({document:{querySelector:element,activeElement:null},FormData:class{},setInterval(){},console,
   fetch:async(path,options={})=>{
@@ -25,7 +25,8 @@ vm.runInContext(fs.readFileSync('dashboard_ui.js','utf8'),context);
   await context.run();
   assert.equal(calls.filter(c=>c.path==='/api/edit').length,0,'resume cannot clear existing tasks through auto-save');
   assert.equal(calls.filter(c=>c.path==='/api/settings/count').length,0,'resume cannot save a replacement count');
-  const request=calls.find(c=>c.path==='/api/run');assert.ok(!('task_count' in JSON.parse(request.options.body)));
+  const request=calls.find(c=>c.path==='/api/run'),body=JSON.parse(request.options.body);
+  assert.ok(!('task_count' in body));assert.deepEqual(body.recovery_request_ids,['request-a','request-b']);
   assert.equal(element('#rows').innerHTML,'unsaved rows');
   assert.equal(vm.runInContext('dirty',context),true,'resume preserves unsaved rows');
   assert.match(element('#log').textContent,/继续上次2个脚本/);

@@ -1,4 +1,6 @@
 import hashlib
+import copy
+import re
 import sys
 import tempfile
 import unittest
@@ -6,7 +8,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from doubao_automation.doubao_batch import BatchGenerationMixin,batch_prompt,choose_reply,quota_remaining
+from doubao_automation.doubao_batch import (BatchGenerationMixin,batch_prompt,choose_reply,
+                                             generation_unavailable_matches,quota_exhaustion_matches,
+                                             quota_remaining)
+from doubao_automation.doubao_agent import DEFAULT_QUOTA_EXHAUSTED_PATTERNS
 
 
 def asset(url,index=0):
@@ -55,6 +60,43 @@ class BatchTests(unittest.TestCase):
                      'start_seconds':15*i,'end_seconds':15*(i+1),'prompt':f'本段原文{i}'} for i in range(2)]
         self.dests={t['id']:Path(self.tmp.name)/f'{i}.mp4' for i,t in enumerate(self.tasks)}
     def tearDown(self):self.tmp.cleanup()
+
+    def test_platform_free_video_quota_word_order_is_recognized(self):
+        patterns=[re.compile(pattern,re.IGNORECASE) for pattern in DEFAULT_QUOTA_EXHAUSTED_PATTERNS]
+        self.assertTrue(quota_exhaustion_matches('今日视频生成免费额度已用完。开通订阅畅享更多额度。',patterns))
+        self.assertTrue(quota_exhaustion_matches('今日免费视频额度已经耗尽',patterns))
+        self.assertFalse(quota_exhaustion_matches('网络连接错误：今日视频生成免费额度已用完',patterns))
+        self.assertFalse(quota_exhaustion_matches('今日视频生成暂时失败，请稍后重试',patterns))
+
+    def test_explicit_rendering_capability_refusal_is_recognized(self):
+        refusal='我无法直接执行视频渲染输出并提供下载文件，这份是已经打磨好的成品生成提示词。'
+        self.assertTrue(generation_unavailable_matches(refusal))
+        self.assertTrue(generation_unavailable_matches('I cannot render or generate this video.'))
+        self.assertFalse(generation_unavailable_matches('视频正在生成，请稍候。'))
+
+    def test_definitive_quota_denial_after_active_reply_is_safe_to_release(self):
+        agent=Agent([[]],['生成中','今日视频生成免费额度已用完。开通订阅畅享更多额度。'])
+        agent.quota_patterns=[re.compile(pattern,re.IGNORECASE)
+                              for pattern in DEFAULT_QUOTA_EXHAUSTED_PATTERNS]
+        result,generated,_=self.run_agent(agent)
+        self.assertEqual(result['error_kind'],'quota')
+        self.assertTrue(result['continuation_safe'])
+        self.assertFalse(generated)
+        self.assertEqual(len(agent.sent),1)
+
+    def test_capability_refusal_stops_polling_without_claiming_video_was_generated(self):
+        refusal='我无法直接执行视频渲染输出并提供下载文件，这份是已经打磨好的成品生成提示词。'
+        agent=Agent([[]],[refusal])
+        result,generated,_=self.run_agent(agent)
+        self.assertEqual(result['error_kind'],'not_generated')
+        self.assertTrue(result['continuation_safe'])
+        self.assertEqual(result['rejection_evidence'],{
+            'kind':'generation_unavailable','definitive':True,'active':False,
+            'source':'latest_assistant','video_asset_found':False})
+        self.assertFalse(generated)
+        self.assertEqual(len(agent.sent),1)
+        self.assertLess(agent.page.clock,60)
+
     def run_agent(self,agent,context=None):
         generated=[];submitted=[]
         with patch('doubao_automation.doubao_batch.time.monotonic',side_effect=lambda:agent.page.clock):
@@ -89,6 +131,62 @@ class BatchTests(unittest.TestCase):
         result,generated,_=self.run_agent(agent,{'resume_only':True,'chat_url':agent.page.url,
           'baseline':{'keys':[]},'remote_refs':{self.tasks[0]['id']:ref}})
         self.assertEqual(len(generated),2);self.assertFalse(result['unresolved']);self.assertFalse(agent.sent)
+
+    def resumed_confirmation(self, controls):
+        task={'id':'script#seg0','script_id':'script','seg_index':0,'seg_total':1,
+              'target_seconds':15,'est_seconds':15,'start_seconds':0,'end_seconds':15,'prompt':'original'}
+        agent=Agent([[]])
+        owner={'prompt':'original prompt','marker':'【自动化任务标记：request-approved】',
+               'chat_path':'/chat/123456789','control_texts':[],'task_ids':[task['id']]}
+        owner['original_anchor_proof']=agent._original_anchor_proof(owner,owner['chat_path'])
+        baseline={'scope_version':1,'ownership_acknowledged':True,'ownership':owner,
+                  'keys':[],'assets':[],'card_count':0,'controls':copy.deepcopy(controls)}
+        scope={'owner_found':True,'route_ready':True,'route_marker_found':True,
+               'chat_path':owner['chat_path'],'anchor_kind':'original','user_message_id':'user-original',
+               'latest_control_mounted':True,'later_user_turn':False,
+               'latest_reply_message_id':'assistant-confirm'}
+        def assets():
+            agent._batch_scope_state=scope
+            agent._batch_cards_snapshot=[]
+            return []
+        agent._batch_assets=assets
+        replies=iter(['请确认后开始生成','生成中'])
+        def assistant():
+            agent._last_reply_source='latest_assistant'
+            return next(replies,'生成中')
+        agent._assistant_text=assistant
+        submitted=[]
+        with patch('doubao_automation.doubao_batch.time.monotonic',side_effect=lambda:agent.page.clock):
+            result=agent.run_batch([task],[],{task['id']:self.dests['s#seg0']},
+                {'total_seconds':15,'resume_only':True,'chat_url':agent.page.url,'task_ids':[task['id']],
+                 'original_task_ids':[task['id']],'baseline':baseline},
+                lambda url,value:submitted.append((url,copy.deepcopy(value))),lambda *_:None)
+        return agent,result,submitted
+
+    def test_approved_resume_sends_one_confirmation_without_resending_original_prompt(self):
+        task_id='script#seg0'
+        agent,result,submitted=self.resumed_confirmation([
+            {'phase':'operator_approved_resume','task_ids':[task_id]},
+        ])
+        self.assertEqual(agent.sent,['确认，开始生成这条视频。'])
+        self.assertNotIn('original prompt',agent.sent[0])
+        self.assertEqual(result['submitted'],True)
+        self.assertTrue(submitted)
+        saved=[control for _,value in submitted for control in value['controls']
+               if control['phase']=='operator_confirmation_dispatched']
+        self.assertEqual(len(saved),1)
+
+    def test_resume_without_approval_or_after_dispatch_never_sends_confirmation_twice(self):
+        task_id='script#seg0'
+        agent,result,_=self.resumed_confirmation([])
+        self.assertEqual(result['error_kind'],'needs_user')
+        self.assertEqual(agent.sent,[])
+        agent,result,_=self.resumed_confirmation([
+            {'phase':'operator_approved_resume','task_ids':[task_id]},
+            {'phase':'operator_confirmation_dispatched','task_ids':[task_id]},
+        ])
+        self.assertEqual(result['error_kind'],'needs_user')
+        self.assertEqual(agent.sent,[])
     def test_partial_unknown_request_never_automatically_resubmits(self):
         a=asset('https://cdn/one.mp4')
         agent=Agent([[],[a]])

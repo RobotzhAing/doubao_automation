@@ -4,9 +4,9 @@ import unittest
 from doubao_automation.script_splitter import build_segments, parse_timestamp_blocks
 
 
-def script(prefix='', ranges=((0, 5), (5, 10), (10, 15))):
+def script(prefix='', ranges=((0, 5), (5, 10), (10, 15)), suffix=''):
     return '总时长：15秒\n' + ''.join(
-        f'{prefix}00:{start:02d}-00:{end:02d}\n'
+        f'{prefix}00:{start:02d}-00:{end:02d}{suffix}\n'
         f'摄影与构图：产品近景。\n视觉与动作：展示动作{start}。\n'
         f'音频与口播：测试片段{start}。\n'
         for start, end in ranges)
@@ -40,6 +40,14 @@ class TimestampLabelTests(unittest.TestCase):
 
     def test_bare_timestamps_retain_the_existing_plan(self):
         self.assertEqual([s['est_seconds'] for s in build_segments(script(), {})], [15])
+
+    def test_bracketed_timestamp_ranges_retain_the_complete_plan(self):
+        text=script('【', suffix='】')
+        blocks=parse_timestamp_blocks(text)
+        self.assertEqual([(b['start'], b['end']) for b in blocks], [(0,5),(5,10),(10,15)])
+        segments=build_segments(text,{})
+        self.assertEqual([s['est_seconds'] for s in segments],[15])
+        self.assertEqual((segments[0]['start_seconds'],segments[0]['end_seconds']),(0,15))
 
     def test_reference_text_is_not_treated_as_a_timeline_heading(self):
         self.assertEqual(parse_timestamp_blocks('参考视频【时间轴】00:00-00:05\n一般说明。'), [])

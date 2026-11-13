@@ -438,7 +438,7 @@ class GeminiWeb:
             self.page.wait_for_timeout(500)
         raise GeminiError('Gemini 附件未在时限内确认上传完成；未发送提示词，请检查本地诊断')
 
-    def upload_files(self, paths: list):
+    def upload_files(self, paths: list, *, prefer_file_chooser=False):
         """Wait for hydrated controls, choose a media-compatible input, then prove attachment readiness."""
         if not paths:
             return
@@ -455,47 +455,71 @@ class GeminiWeb:
             self._submission_attempted=True
             raise GeminiSubmissionUncertain('Gemini 输入区已有未识别附件；为避免重复提交或误发旧素材，已保留草稿并停止本次处理')
         openers = _selectors(self.sel.get('open_upload')) or _UPLOAD_OPENERS
-        deadline = time.monotonic() + float(self.gcfg.get('upload_control_timeout_seconds', 30))
+        labels = _selectors(self.sel.get('upload_menu_items')) or ['上传文件', 'Upload files']
+        timeout = float(self.gcfg.get('upload_control_timeout_seconds', 30))
+        deadline = time.monotonic() + timeout
+        next_status = time.monotonic() + 10
+        opened_at = None
+        menu_clicked = False
+        choosers = []
+        def on_chooser(chooser):
+            choosers.append(chooser)
         ok = False
-        while time.monotonic() < deadline:
-            if self._set_upload_input(paths):
-                ok = True
-                break
-            buttons = page.locator(_combine(openers)).filter(visible=True)
-            if buttons.count() and buttons.first.is_enabled():
-                chooser = None
-                try:
-                    with page.expect_file_chooser(timeout=1500) as event:
-                        buttons.first.click(timeout=5000)
-                    chooser = event.value
-                except Exception:
-                    # The normal current UI opens a menu, not a system dialog.
-                    pass
-                if chooser is not None:
+        # Keep listening through lazy menu hydration and delayed chooser events;
+        # a short expect_file_chooser timeout is not proof the menu is missing.
+        page.on('filechooser', on_chooser)
+        try:
+            while time.monotonic() < deadline:
+                if self._check_for_external_submission():
+                    return
+                if choosers:
+                    if len(choosers) != 1:
+                        raise GeminiError('Gemini 出现多个文件选择窗口，未选择文件，请核对上传入口')
+                    chooser = choosers[0]
                     if not self._input_accepts(chooser.element, paths):
-                        raise GeminiError('上传入口不接受当前视频类型，未选择文件')
-                    chooser.set_files([str(path) for path in paths])
+                        raise GeminiError('上传入口不接受当前文件类型，未选择文件')
+                    chooser.set_files([str(path) for path in paths], timeout=30000)
                     ok = True
-                elif self._set_upload_input(paths):
+                    break
+                # A sent turn may leave a detached, compatible file input in the
+                # document. On same-chat retries, open the live composer menu and
+                # use its chooser instead of silently populating that stale input.
+                if not prefer_file_chooser and self._set_upload_input(paths):
                     ok = True
-                else:
-                    labels = _selectors(self.sel.get('upload_menu_items')) or ['上传文件', 'Upload files']
+                    break
+                remaining_ms = max(1, (deadline - time.monotonic()) * 1000)
+                if not menu_clicked:
+                    # A menu may already be open (including a human click).
+                    # Do not toggle the opener before checking its menu items.
                     for label in labels:
                         items = page.get_by_role('menuitem', name=re.compile(r'^' + re.escape(label) + r'(?:[.。]|$)')).filter(visible=True)
-                        if not items.count():
-                            continue
-                        with page.expect_file_chooser(timeout=8000) as event:
-                            items.first.click(timeout=5000)
-                        chooser = event.value
-                        if not self._input_accepts(chooser.element, paths):
-                            raise GeminiError('上传菜单不接受当前视频类型，未选择文件')
-                        chooser.set_files([str(path) for path in paths])
-                        ok = True
-                        break
-                break
-            page.wait_for_timeout(250)
+                        item = next((items.nth(i) for i in range(items.count()) if items.nth(i).is_enabled()), None)
+                        if item is not None:
+                            item.click(timeout=min(5000, remaining_ms))
+                            menu_clicked = True
+                            break
+                    if not menu_clicked:
+                        buttons = page.locator(_combine(openers)).filter(visible=True)
+                        button = next((buttons.nth(i) for i in range(buttons.count()) if buttons.nth(i).is_enabled()), None)
+                        if button is not None:
+                            expanded = button.get_attribute('aria-expanded')
+                            # Retry a pre-hydration click only when the control
+                            # explicitly says it is still closed, never blindly.
+                            retry_closed = (opened_at is not None and expanded == 'false'
+                                            and time.monotonic() - opened_at >= 1.5)
+                            if expanded != 'true' and (opened_at is None or retry_closed):
+                                button.click(timeout=min(5000, remaining_ms))
+                                opened_at = time.monotonic()
+                now = time.monotonic()
+                if now >= next_status:
+                    phase = '文件选择器' if menu_clicked else '上传菜单' if opened_at is not None else '上传按钮'
+                    print(f'[Gemini] 等待{phase}就绪，尚未选择文件（剩余{max(0, deadline-now):.0f}秒）', flush=True)
+                    next_status = now + 10
+                page.wait_for_timeout(min(250, max(0, (deadline - now) * 1000)))
+        finally:
+            page.remove_listener('filechooser', on_chooser)
         if not ok:
-            raise GeminiError('无法找到可用的 Gemini 视频上传入口，请运行 inspect-gemini 检查页面')
+            raise GeminiError(f'无法找到可用的 Gemini 视频上传入口（已等待{timeout:g}秒，菜单点击={menu_clicked}）；未选择文件或发送提示词，请检查本地诊断')
         page.keyboard.press('Escape')
         print(f'[Gemini] 已选择 {len(paths)} 个文件，等待实际附件上传完成…', flush=True)
         self._wait_uploads(paths)
@@ -850,7 +874,7 @@ class GeminiWeb:
             print('[Gemini] 提示词草稿已填写，附件就绪前不会发送', flush=True)
             if video_paths:
                 try:
-                    self.upload_files(video_paths)
+                    self.upload_files(video_paths,prefer_file_chooser=_refusal_context is not None)
                 except Exception:
                     # The editor can be detached by a manual submission at the same
                     # moment an upload wait times out. Reconcile the conversation

@@ -49,6 +49,18 @@ def quota_remaining(text):
     return min(values) if values else None
 
 
+def generation_unavailable_matches(text):
+    """Match an assistant's explicit statement that it cannot render a video."""
+    normalized = ' '.join((text or '').split())
+    patterns = (
+        r'(?:我)?(?:目前|暂时)?(?:无法|不能|不支持)[^。！？\n]{0,40}'
+        r'(?:生成|渲染|制作|创建)[^。！？\n]{0,16}(?:视频|下载文件|成品)',
+        r'(?:unable to|cannot|can\'t|do not have the ability to)'
+        r'[^.!?\n]{0,40}(?:generate|render|create)[^.!?\n]{0,16}video',
+    )
+    return any(re.search(pattern, normalized, re.IGNORECASE) for pattern in patterns)
+
+
 def batch_prompt(tasks, context):
     if not 1 <= len(tasks) <= 2:
         raise ValueError('一批只能请求1或2条视频')
@@ -185,6 +197,11 @@ class BatchGenerationMixin:
             # A collapsed original turn cannot establish the slot ordering of
             # a multi-output request. Keep that ambiguous case fail-closed.
             spec['allow_verified_control_anchor'] = bool(proof_valid and len(spec['task_ids']) == 1)
+            approved_tasks = [control.get('task_ids') or [] for control in baseline.get('controls', [])
+                              if isinstance(control, dict) and control.get('phase') == 'operator_approved_resume']
+            spec['allow_operator_confirmation_anchor'] = bool(
+                proof_valid and len(spec['task_ids']) == 1
+                and any(len(ids) == 1 and ids[0] == spec['task_ids'][0] for ids in approved_tasks))
             return spec
         saved = baseline.get('ownership')
         if isinstance(saved, dict) and any(saved.get(k) for k in ('marker', 'prompt', 'user_message_id')):
@@ -268,6 +285,34 @@ class BatchGenerationMixin:
             and not ownership.get('user_message_id') and not ownership.get('original_anchor_proof'))
         return evidence
 
+    def _wait_for_video_skill_controls(self, skill):
+        probe = '''skill => [...document.querySelectorAll('button')].some(b => {
+          const text=(b.innerText||b.getAttribute('aria-label')||'').trim();
+          return b.getClientRects().length && (text===skill || /(?:^|[·\\s])(?:[4-9]|1[0-5])\\s*(?:s|秒)$/i.test(text));
+        })'''
+        try:
+            self.page.wait_for_function(probe, arg=skill, timeout=5000)
+            return
+        except Exception:
+            # New Doubao composer layouts place video generation under the
+            # visible “技能” menu instead of rendering its control directly.
+            # Open only that menu, then continue through the existing exact
+            # video-skill and saved-duration checks below.
+            try:
+                menus=self.page.get_by_role('button',name=re.compile(r'^技能(?:$|[\s›>·])'))
+                menu=next((menus.nth(i) for i in range(menus.count())
+                           if menus.nth(i).is_visible() and menus.nth(i).is_enabled()),None)
+            except Exception:
+                menu=None
+            if menu is not None:
+                menu.click(timeout=4000)
+                self.page.wait_for_function(probe,arg=skill,timeout=15000)
+                return
+        # Preserve the full hydration window for existing layouts where the
+        # controls appear without a menu, but fail before upload or send if
+        # neither supported layout becomes available.
+        self.page.wait_for_function(probe,arg=skill,timeout=25000)
+
     def configure_video_mode(self, inspect_menu=False):
         """Select the existing video skill and its 15-second control when exposed."""
         skill = self.dcfg.get('video_skill_name', '视频生成')
@@ -275,10 +320,7 @@ class BatchGenerationMixin:
         # Existing chats render their composer after DOMContentLoaded.  Looking
         # up buttons immediately after navigation mistakes that loading state
         # for a missing control, especially on the second batch in one chat.
-        self.page.wait_for_function('''skill => [...document.querySelectorAll('button')].some(b => {
-          const text=(b.innerText||b.getAttribute('aria-label')||'').trim();
-          return b.getClientRects().length && (text===skill || /(?:^|[·\\s])(?:[4-9]|1[0-5])\\s*(?:s|秒)$/i.test(text));
-        })''',arg=skill,timeout=30000)
+        self._wait_for_video_skill_controls(skill)
         button = self.page.get_by_role('button', name=skill, exact=True)
         controls=self.page.get_by_role('button',name=selector)
         if (self.dcfg.get('use_video_skill', True) and not controls.count()
@@ -342,8 +384,49 @@ class BatchGenerationMixin:
         raise RuntimeError(f'未能确认视频时长已选择15秒且比例为{desired_ratio}，发送前已停止')
 
     def _batch_assets(self):
+        ownership = getattr(self, '_batch_ownership', {})
+        # Long user prompts are collapsed by Doubao. The unique request marker
+        # is appended at the end, so it can be absent from the rendered text
+        # even though the exact turn and its reply are already in the chat.
+        # Expand only candidate user turns whose visible prefix matches this
+        # request; this changes presentation only and never submits anything.
+        try:
+            expanded = self.page.evaluate('''ownership => {
+              const norm = text => String(text || '').replace(/\\s+/g, '')
+                .replace(/(\\.(?:png|jpe?g|webp|gif|avif))\\+(\\d+)/gi, '$1$2');
+              const prompt = norm(ownership.prompt), marker = norm(ownership.marker);
+              if (!prompt) return false;
+              const prefix = prompt.slice(0, Math.min(96, prompt.length));
+              const users = document.querySelectorAll('[data-testid="send_message"], [data-message-role="user"], [data-role="user"]');
+              for (const node of users) {
+                const content = node.querySelector('[data-testid="message_text_content"]');
+                const text = norm(content ? content.textContent : node.textContent);
+                const complete = marker ? text.includes(marker) && text.includes(prompt) : text.includes(prompt);
+                if (complete || !text.includes(prefix)) continue;
+                const expand = node.querySelector('[data-testid="message_expand_all_button"]');
+                if (expand && expand.getClientRects().length && getComputedStyle(expand).visibility !== 'hidden') {
+                  expand.click();
+                  return true;
+                }
+              }
+              return false;
+            }''', ownership)
+            if expanded:
+                self.page.wait_for_timeout(75)
+        except Exception:
+            # The message list can be between virtualized renders. The normal
+            # ownership scan below remains fail-closed and will poll again.
+            pass
         observed=self.page.evaluate('''ownership => {
-          const norm = text => String(text || '').replace(/\\s+/g, '');
+          // Doubao renders attachment markers such as "image.webp + 1" as
+          // "image.webp1" in message text. Normalize only that UI transform
+          // so the saved prompt still has to match in full.
+          const norm = text => String(text || '').replace(/\\s+/g, '')
+            .replace(/(\\.(?:png|jpe?g|webp|gif|avif))\\+(\\d+)/gi, '$1$2');
+          const messageText = node => {
+            const content = node.querySelector('[data-testid="message_text_content"]');
+            return norm(content ? content.textContent : node.textContent);
+          };
           const canonical = [...document.querySelectorAll('[data-testid="send_message"], [data-testid="receive_message"]')];
           const canonicalRoots = canonical.filter((node, index, all) =>
             !all.some((other, j) => j !== index && other.contains(node)));
@@ -361,23 +444,26 @@ class BatchGenerationMixin:
           const owns = node => {
             if (!user(node)) return false;
             if (ownership.user_message_id) return id(node) === ownership.user_message_id;
-            const text = norm(node.querySelector('[data-testid="message_text_content"]')?.innerText || node.innerText);
+            const text = messageText(node);
             return ownership.marker ? text.includes(norm(ownership.marker)) &&
               (!ownership.prompt || text.includes(norm(ownership.prompt))) :
               Boolean(ownership.prompt && text.includes(norm(ownership.prompt)));
           };
+          const compact = text => norm(text).replace(/[，,。.!！?？:：;；]/g, '');
+          const isStartConfirmation = text =>
+            /^(?:(?:确认|好的|可以|是的|同意)?(?:现在|立即)?开始生成(?:这条|该)?视频)$/.test(compact(text));
           let anchors = messages.filter(owns), anchorKind='original';
           if (!anchors.length && ownership.user_message_id && ownership.chat_path === location.pathname && ownership.prompt) {
             // A reload can replace a DOM-only node ID. The complete original
             // prompt must still match uniquely in the same locked chat.
             anchors = messages.filter(node => user(node) &&
-              norm(node.querySelector('[data-testid="message_text_content"]')?.innerText || node.innerText).includes(norm(ownership.prompt)) &&
-              (!ownership.marker || norm(node.innerText).includes(norm(ownership.marker))));
+              messageText(node).includes(norm(ownership.prompt)) &&
+              (!ownership.marker || messageText(node).includes(norm(ownership.marker))));
           }
           // No authenticated ownership proof means no asset, including when
           // old history hydrates after an apparently empty composer.
           const markerMatches = ownership.marker ? messages.filter(node => user(node) &&
-            norm(node.querySelector('[data-testid="message_text_content"]')?.innerText || node.innerText).includes(norm(ownership.marker))) : [];
+            messageText(node).includes(norm(ownership.marker))) : [];
           // A unique request marker may bind a recovery route while the full
           // prompt is still hydrating. It never grants access to assets.
           const routeMarkerFound = markerMatches.length === 1;
@@ -392,28 +478,58 @@ class BatchGenerationMixin:
             const control = norm((ownership.control_texts || []).at(-1));
             if (control) {
               anchors = messages.filter(node => user(node) &&
-                norm(node.querySelector('[data-testid="message_text_content"]')?.innerText || node.innerText) === control);
+                messageText(node) === control);
               anchorKind='verified_control';
+            }
+          }
+          let operatorConfirmationNode = null;
+          if (ownership.allow_operator_confirmation_anchor === true &&
+              ownership.chat_path === location.pathname && /^\\/chat\\/\\d+\\/?$/.test(location.pathname)) {
+            // The operator may have confirmed directly in Doubao, outside this
+            // process. Accept only one exact start-generation phrase, as the
+            // latest user turn, immediately following an assistant request to
+            // confirm. The saved prompt proof and resume approval bind it to
+            // this single task and formal chat.
+            const userTurns = messages.filter(user);
+            const confirmations = userTurns.filter(node => isStartConfirmation(messageText(node)));
+            const confirmation = confirmations.length === 1 ? confirmations[0] : null;
+            const confirmationIndex = confirmation ? messages.indexOf(confirmation) : -1;
+            const previousAssistant = confirmationIndex > 0
+              ? [...messages.slice(0, confirmationIndex)].reverse().find(node => !user(node)) : null;
+            const previousText = previousAssistant ? messageText(previousAssistant) : '';
+            const askedToConfirm = /确认后.{0,80}开始生成|请.{0,40}确认.{0,80}(?:开始|生成)|(?:需要|等待).{0,30}确认.{0,80}(?:开始|生成)/.test(previousText);
+            const followsOwner = !anchors.length || messages.indexOf(anchors[0]) < confirmationIndex;
+            if (confirmation && userTurns.at(-1) === confirmation && askedToConfirm && followsOwner) {
+              operatorConfirmationNode = confirmation;
+              if (!anchors.length) {
+                anchors = [confirmation];
+                anchorKind = 'operator_confirmed';
+              }
             }
           }
           if (anchors.length !== 1) return empty;
           const anchor = anchors[0], anchorIndex = messages.indexOf(anchor);
-          const originalUserID = anchorKind === 'original' ? id(anchor) : (ownership.user_message_id || '');
+          const originalUserID = anchorKind === 'original' ? id(anchor) : (ownership.user_message_id || id(anchor));
           const routeReady = /^\\/chat\\/\\d+\\/?$/.test(location.pathname) &&
             (!ownership.chat_path || ownership.chat_path === location.pathname);
           const metadata = {owner_found:true, route_ready:routeReady, user_message_id:originalUserID,
                             route_marker_found:routeMarkerFound,
-                            anchor_kind:anchorKind, control_message_id:anchorKind === 'verified_control' ? id(anchor) : '',
+                            anchor_kind:anchorKind, control_message_id:['verified_control','operator_confirmed'].includes(anchorKind) ? id(anchor) : '',
                             chat_path:location.pathname, latest_reply:''};
           if (!routeReady) return {...empty, ...metadata};
           const allowed = (ownership.control_texts || []).map(norm);
           const latestControl = allowed.at(-1);
-          metadata.latest_control_mounted = !latestControl || anchorKind === 'verified_control';
+          const operatorConfirmationText = operatorConfirmationNode ? messageText(operatorConfirmationNode) : '';
+          if (operatorConfirmationText) allowed.push(norm(operatorConfirmationText));
+          metadata.latest_control_mounted = !latestControl || anchorKind === 'verified_control' || Boolean(operatorConfirmationText);
+          metadata.operator_confirmation_text = operatorConfirmationText;
+          if (operatorConfirmationNode) metadata.control_message_id = id(operatorConfirmationNode);
           metadata.later_user_turn = false;
           const received=[]; let latestOwned=null;
-          for (const node of messages.slice(anchorIndex + 1)) {
+          const responseAnchorIndex = operatorConfirmationNode ? messages.indexOf(operatorConfirmationNode) : anchorIndex;
+          for (const node of messages.slice(responseAnchorIndex + 1)) {
             if (user(node)) {
-              const text=norm(node.querySelector('[data-testid="message_text_content"]')?.innerText || node.innerText);
+              const text=messageText(node);
               if (!allowed.some(value => value && text === value)) {
                 metadata.later_user_turn = true;
                 break;
@@ -570,6 +686,23 @@ class BatchGenerationMixin:
         except Exception:
             return True
 
+    def _observe_live_quota_balance(self, context):
+        """Record a balance only from the explicitly configured visible UI element."""
+        selector = getattr(self, 'sel', {}).get('quota_balance')
+        if not selector:
+            return None
+        selector = selector if isinstance(selector, str) else ', '.join(selector)
+        try:
+            element = self.page.locator(selector).first
+            if not element.count() or not element.is_visible():
+                return None
+            observed = quota_remaining(element.inner_text(timeout=4000))
+        except Exception:
+            return None
+        if observed is not None and context.get('on_quota_remaining'):
+            context['on_quota_remaining'](observed)
+        return observed
+
     def _can_recheck_original_chat(self, chat_url, baseline, scope):
         chat_path = formal_doubao_chat_path(chat_url)
         ownership = self._batch_ownership
@@ -643,6 +776,7 @@ class BatchGenerationMixin:
                     self.page.goto(target, wait_until='domcontentloaded')
                     self.page.wait_for_timeout(3000)
                 self._assert_logged_in()
+                self._observe_live_quota_balance(context)
             else:
                 self.open_chat()
                 target = context.get('chat_url', '')
@@ -651,20 +785,9 @@ class BatchGenerationMixin:
                 else:
                     self.new_chat()
                 self.configure_video_mode()
-                # A whole-page search could match a user's prompt or old chat.
-                # Only inspect an explicitly configured visible balance element.
-                observed = None
-                balance_selector = getattr(self, 'sel', {}).get('quota_balance')
-                if balance_selector:
-                    selector = balance_selector if isinstance(balance_selector, str) else ', '.join(balance_selector)
-                    try:
-                        element = self.page.locator(selector).first
-                        if element.count() and element.is_visible():
-                            observed = quota_remaining(element.inner_text(timeout=4000))
-                    except Exception:
-                        pass
-                if observed is not None and context.get('on_quota_remaining'):
-                    context['on_quota_remaining'](observed)
+                # Never infer a balance from conversation text; use only a
+                # visible, explicitly configured account balance element.
+                self._observe_live_quota_balance(context)
                 self.upload_images(image_paths)
                 self._batch_body_before = self.page.locator('body').inner_text(timeout=4000)
                 assets = self._batch_assets()
@@ -715,6 +838,19 @@ class BatchGenerationMixin:
                     self._handle_dialogs()
                 assets = self._batch_assets()
                 scope = getattr(self, '_batch_scope_state', None)
+                operator_confirmation = (scope or {}).get('operator_confirmation_text', '')
+                if resume and operator_confirmation and operator_confirmation not in self._batch_ownership.get('control_texts', []):
+                    controls = list(self._batch_ownership.get('control_texts') or [])
+                    controls.append(operator_confirmation)
+                    self._batch_ownership['control_texts'] = controls
+                    baseline['ownership'] = self._batch_ownership
+                    baseline.setdefault('controls', []).append({
+                        'phase': 'operator_confirmed_resume',
+                        'task_ids': list(self._batch_ownership.get('task_ids') or [task['id'] for task in tasks]),
+                        'message_text': operator_confirmation,
+                        'message_id': (scope or {}).get('control_message_id', ''),
+                    })
+                    on_submitted(result['chat_url'], baseline)
                 ownership_changed = False
                 candidate = urlsplit(self.page.url)
                 if (not resume and self._batch_send_started_fresh and self._batch_initial_send_attempted
@@ -861,13 +997,32 @@ class BatchGenerationMixin:
                 # A reloaded history can briefly show an assistant response
                 # older than the control already sent. Wait for that user turn
                 # before interpreting another confirmation or quota response.
-                controls_current = not (rechecks or short_recovery) or bool(scope and scope.get('latest_control_mounted'))
+                # A resumed request may already have a registered confirmation
+                # from an earlier run. Until that exact user turn is mounted,
+                # the assistant's pre-confirmation reply is stale and must not
+                # be replayed as the current response.
+                # After a page reload, history may temporarily mount the
+                # assistant's pre-confirmation reply before the registered
+                # user control turn. Apply the same stale-reply guard during
+                # normal rechecks and bounded recovery reads, not only resume.
+                controls_current = not (resume or rechecks or short_recovery) or bool(
+                    scope and scope.get('latest_control_mounted'))
                 reply = self._assistant_text()
                 if not controls_current or reply==baseline.get('assistant_before'):
                     reply=''
                 action = choose_reply(reply)
                 active = any(k in reply for k in ('正在生成', '生成中', '排队中', '预计等待', '生成任务已提交'))
                 remote_started |= active or bool(known)
+                if (not known and not assets and not cards and not active and reply
+                        and getattr(self,'_last_reply_source','')=='latest_assistant'
+                        and generation_unavailable_matches(reply)):
+                    evidence=dict(kind='generation_unavailable',definitive=True,active=False,
+                                  source='latest_assistant',video_asset_found=False)
+                    self._save_batch_debug(context,reply)
+                    result.update(error_kind='not_generated',
+                                  error='豆包最新回复明确表示未执行视频渲染；没有生成视频产物',
+                                  rejection_evidence=evidence,continuation_safe=True)
+                    return result
                 if action == 'needs_user':
                     result.update(error_kind='needs_user', error='豆包需要人工完成验证，已保存当前请求')
                     return result
@@ -886,32 +1041,65 @@ class BatchGenerationMixin:
                     explicit_remaining = bool(known) and bool(re.search(r'(第二|第2|下一|另一)[^。\n]{0,24}(?:是否|需要|确认|继续)|(?:是否|确认|继续)[^。\n]{0,24}(第二|第2|下一|另一)',reply))
                     if (action in ('split','confirm','single') and missing_tasks and not active
                             and (resume or phase in control_phases or not remote_started or explicit_remaining)):
-                        if resume or phase in control_phases:
+                        if resume:
+                            task_ids=list(self._batch_ownership.get('task_ids') or [task['id'] for task in tasks])
+                            approved=any(isinstance(control,dict)
+                                         and control.get('phase')=='operator_approved_resume'
+                                         and control.get('task_ids')==task_ids
+                                         for control in baseline.get('controls',[]))
+                            already_confirmed=any(isinstance(control,dict)
+                                                 and control.get('phase') in ('operator_confirmation_dispatched',
+                                                                             'operator_confirmed_resume')
+                                                 and control.get('task_ids')==task_ids
+                                                 for control in baseline.get('controls',[]))
+                            if action=='confirm' and len(tasks)==1 and approved and not already_confirmed:
+                                confirmation='确认，开始生成这条视频。'
+                                controls=list(self._batch_ownership.get('control_texts') or [])
+                                controls.append(confirmation)
+                                self._batch_ownership['control_texts']=controls
+                                baseline['ownership']=self._batch_ownership
+                                baseline.setdefault('controls',[]).append({
+                                    'phase':'operator_confirmation_dispatched','task_ids':task_ids,
+                                    'message_text':confirmation,
+                                })
+                                # Persist the one-shot dispatch before typing; an
+                                # interrupted click must never trigger a duplicate.
+                                on_submitted(self.page.url,baseline)
+                                last_reply_identity=reply_identity
+                                self.type_and_send(confirmation)
+                                self._batch_sent_prompt=confirmation
+                                next_recheck=time.monotonic()+_CHAT_RECHECK_IDLE_SECONDS
+                            else:
+                                self._save_batch_debug(context,reply)
+                                result.update(error_kind='needs_user', continuation_safe=False,
+                                              error='原请求仍等待平台确认；缺少一次性操作员恢复批准，或确认已发送过，禁止重复发送')
+                                return result
+                        elif phase in control_phases:
                             self._save_batch_debug(context,reply)
                             result.update(error_kind='needs_user', continuation_safe=False,
-                                          error=('原请求仍等待平台确认；恢复模式不会发送消息，请在原会话明确确认开始后再继续'
-                                                 if resume else '已发送一次明确开始生成指令，平台仍要求确认；已停止自动确认，请在原会话人工核对，尚未领取任何未确认产物'))
+                                          error='已发送一次明确开始生成指令，平台仍要求确认；已停止自动确认，请在原会话人工核对，尚未领取任何未确认产物')
                             return result
-                        control_phases.add(phase)
-                        one_at_time |= action=='single' and not remote_started
-                        follow_tasks = missing_tasks[:1] if one_at_time else missing_tasks
-                        windows='、'.join(f'第{t["seg_index"]+1}段（{t.get("start_seconds",0):g}–{t.get("end_seconds",t["est_seconds"]):g}秒）' for t in follow_tasks)
-                        clarification=f'确认，立即开始生成上述{windows}的独立视频，严格沿用上面的原始剧本和已选择的视频参数。'
-                        if action == 'split':
-                            clarification += '已选择分段分别生成，不压缩整片。'
-                        clarification += f'本次仅生成这{len(follow_tasks)}条，各自独立提供视频；其他窗口不要生成，不再重复列参数或询问确认。'
-                        if self._batch_ownership.get('marker'):
-                            clarification += '\n' + self._batch_ownership['marker']
-                            clarification += '\n此标记仅用于自动化定位，不得出现在生成内容、视频画面、字幕或口播中。'
-                        self._batch_ownership.setdefault('control_texts', []).append(clarification)
-                        baseline['controls'].append({'phase':phase,'task_ids':[t['id'] for t in follow_tasks]})
-                        if known and one_at_time:
-                            single_followups.update(t['id'] for t in follow_tasks)
-                        on_submitted(self.page.url,baseline)
-                        last_reply_identity = reply_identity
-                        self.type_and_send(clarification)
-                        self._batch_sent_prompt = clarification
-                        next_recheck = time.monotonic() + _CHAT_RECHECK_IDLE_SECONDS * 2 ** rechecks
+                        else:
+                            control_phases.add(phase)
+                            one_at_time |= action=='single' and not remote_started
+                            follow_tasks = missing_tasks[:1] if one_at_time else missing_tasks
+                            windows='、'.join(f'第{t["seg_index"]+1}段（{t.get("start_seconds",0):g}–{t.get("end_seconds",t["est_seconds"]):g}秒）' for t in follow_tasks)
+                            clarification=f'确认，立即开始生成上述{windows}的独立视频，严格沿用上面的原始剧本和已选择的视频参数。'
+                            if action == 'split':
+                                clarification += '已选择分段分别生成，不压缩整片。'
+                            clarification += f'本次仅生成这{len(follow_tasks)}条，各自独立提供视频；其他窗口不要生成，不再重复列参数或询问确认。'
+                            if self._batch_ownership.get('marker'):
+                                clarification += '\n' + self._batch_ownership['marker']
+                                clarification += '\n此标记仅用于自动化定位，不得出现在生成内容、视频画面、字幕或口播中。'
+                            self._batch_ownership.setdefault('control_texts', []).append(clarification)
+                            baseline['controls'].append({'phase':phase,'task_ids':[t['id'] for t in follow_tasks]})
+                            if known and one_at_time:
+                                single_followups.update(t['id'] for t in follow_tasks)
+                            on_submitted(self.page.url,baseline)
+                            last_reply_identity = reply_identity
+                            self.type_and_send(clarification)
+                            self._batch_sent_prompt = clarification
+                            next_recheck = time.monotonic() + _CHAT_RECHECK_IDLE_SECONDS * 2 ** rechecks
                 if (controls_current and not resume and one_at_time and result['videos']
                         and len(known) < len(tasks) and not active):
                     next_task = next(t for t in tasks if t['id'] not in known)
@@ -932,7 +1120,11 @@ class BatchGenerationMixin:
                             and quota_exhaustion_matches(reply, self.quota_patterns)):
                         self._save_batch_debug(context,reply)
                         result.update(error_kind='quota', error='豆包提示视频生成次数已用完',
-                                      continuation_safe=not remote_started)
+                                      # This is a fresh, explicit quota denial and the
+                                      # current reply is not an active-generation status.
+                                      # Earlier "生成中" replies must not turn this
+                                      # definitive rejection into an unknown charge.
+                                      continuation_safe=True)
                         return result
                     if any(p.search(reply) for p in self.failure_patterns) and not action:
                         self._save_batch_debug(context,reply)

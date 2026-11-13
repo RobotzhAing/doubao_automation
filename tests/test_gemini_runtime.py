@@ -221,7 +221,7 @@ class GeminiRuntimeTests(unittest.TestCase):
         self.agent.type_prompt=Mock()
         self.agent.send_prompt=Mock()
         self.agent.wait_response=Mock(return_value=script_fixture(1,15))
-        def upload(_):
+        def upload(_, **kwargs):
             self.agent._response_snapshot=Mock(return_value=snapshot(
                 [],users=1,user_texts=[self.agent._expected_prompt],attachment_counts=[1]))
             self.assertTrue(self.agent._check_for_external_submission())
@@ -596,6 +596,19 @@ class GeminiRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(GeminiError,'数量不符.*3个.*2个'):
             self.agent.generate([], '请生成3个短视频脚本，每条包含15秒分段')
         self.assertEqual(self.agent.generate([], '请生成两个短视频脚本'),raw)
+
+    def test_twenty_video_prompt_rejects_the_observed_three_script_reply(self):
+        message='写20个该产品功能场景应用的15秒爆款tiktok短视频脚本'
+        self.assertEqual(module._explicit_script_count(message),20)
+        self.assertEqual(module._requested_durations(message,20),[15]*20)
+        raw='\n'.join(script_fixture(index,15) for index in range(1,4))
+        self.agent.open=Mock();self.agent.send_prompt=Mock();self.agent.wait_response=Mock(return_value=raw)
+        with self.assertRaisesRegex(module.GeminiResponseRejected,'要求20个，实际3个') as caught:
+            self.agent.generate([],message)
+        self.assertFalse(caught.exception.can_retry_same_request)
+        self.assertEqual(self.agent.send_prompt.call_count,1)
+        self.assertEqual(list(Path(self.temp.name).glob('*completed.response.txt')),[])
+        self.assertEqual(len(list(Path(self.temp.name).glob('*failed.response.txt'))),1)
 
     def test_no_explicit_count_preserves_all_generated_scripts(self):
         raw=script_fixture(1,50)+'\n'+script_fixture(2,70)+'\n'+script_fixture(3,50)
