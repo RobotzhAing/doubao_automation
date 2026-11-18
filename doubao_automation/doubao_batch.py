@@ -10,10 +10,14 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .seedance_models import FAST, MINI, MODEL_LABELS, normalize_model
+
 
 _CHAT_RECHECK_IDLE_SECONDS = 180
 _CHAT_RECHECK_LIMIT = 3
 _CHAT_RECHECK_NAV_TIMEOUT_SECONDS = 10
+_MODEL_CONTROL = re.compile(r'^模型(?:\s+|\s*[:：]\s*)')
+_MODEL_MENU_DETAILS = {MINI: '日常生成使用', FAST: '快速出片选择'}
 
 
 def formal_doubao_chat_path(url):
@@ -313,8 +317,67 @@ class BatchGenerationMixin:
         # neither supported layout becomes available.
         self.page.wait_for_function(probe,arg=skill,timeout=25000)
 
-    def configure_video_mode(self, inspect_menu=False):
-        """Select the existing video skill and its 15-second control when exposed."""
+    def _requested_video_model(self, model=None):
+        if model is None:
+            model = (getattr(self, 'cfg', {}).get('video') or {}).get('model')
+        return normalize_model(model) if model is not None else None
+
+    def _require_video_model(self, model):
+        if model is None:
+            return
+        label = MODEL_LABELS[model]
+        selected = self.page.get_by_role('button', name=re.compile(
+            _MODEL_CONTROL.pattern + re.escape(label) + r'\s*$', re.I))
+        try:
+            selected.wait_for(state='visible', timeout=6000)
+        except Exception:
+            raise RuntimeError(f'未能确认豆包视频模型为 {label}，发送前已停止') from None
+
+    def _configure_video_model(self, model):
+        if model is None:
+            return
+        label = MODEL_LABELS[model]
+        trigger = self.page.get_by_role('button', name=_MODEL_CONTROL)
+        try:
+            trigger.wait_for(state='visible', timeout=10000)
+        except Exception:
+            raise RuntimeError('找不到豆包视频模型控件，发送前已停止') from None
+        selected_name = re.compile(_MODEL_CONTROL.pattern + re.escape(label) + r'\s*$', re.I)
+        if self.page.get_by_role('button', name=selected_name).count() == 1:
+            return
+        try:
+            trigger.click(timeout=4000)
+            menu = self.page.get_by_role('menu', name=_MODEL_CONTROL)
+            menu.wait_for(state='visible', timeout=6000)
+            option_name = re.compile(r'^\s*' + re.escape(label) + r'(?:\s+'
+                                     + re.escape(_MODEL_MENU_DETAILS[model]) + r')?\s*$', re.I)
+            menu.get_by_text(option_name).click(timeout=6000)
+            menu.wait_for(state='hidden', timeout=5000)
+        except Exception:
+            raise RuntimeError(f'无法选择豆包视频模型 {label}，发送前已停止') from None
+        self._require_video_model(model)
+
+    def _preserve_followup_video_model(self, model):
+        if model is None:
+            return
+        # After the initial video submission Doubao can switch the original
+        # chat to a text-only composer for confirmation or follow-up requests.
+        # If the control is still present, keep new generation on the original
+        # request's model. The chat binding still protects text-only followups.
+        trigger = self.page.get_by_role('button', name=_MODEL_CONTROL)
+        if trigger.count() and trigger.first.is_visible():
+            self._configure_video_model(model)
+
+    def _wait_followup_composer(self, deadline):
+        chat_path = formal_doubao_chat_path(self.page.url)
+        if not chat_path:
+            raise RuntimeError('原对话尚未获得正式地址，已停止发送后续消息')
+        self._wait_chat_ready(deadline=min(deadline, time.monotonic() + 20))
+        if formal_doubao_chat_path(self.page.url) != chat_path:
+            raise RuntimeError('等待输入框期间已离开原对话，已停止发送后续消息')
+
+    def configure_video_mode(self, inspect_menu=False, *, model=None):
+        """Select the video skill, requested model, portrait ratio and 15-second duration."""
         skill = self.dcfg.get('video_skill_name', '视频生成')
         selector=re.compile(r'(?:^|[·\s])(?:[4-9]|1[0-5])\s*(?:s|秒)$',re.I)
         # Existing chats render their composer after DOMContentLoaded.  Looking
@@ -328,6 +391,7 @@ class BatchGenerationMixin:
             button.first.click(timeout=5000)
             self.page.get_by_role('button',name=selector).last.wait_for(state='visible',timeout=15000)
         self._handle_dialogs()
+        self._configure_video_model(self._requested_video_model(model))
         controls=self.page.get_by_role('button',name=selector)
         if not controls.count() or not controls.last.is_visible():
             raise RuntimeError('找不到视频时长控件，发送前已停止，避免默认10秒浪费次数')
@@ -750,6 +814,7 @@ class BatchGenerationMixin:
         remote_started = False
         last_url, last_reply_identity = result['chat_url'], ''
         try:
+            model = self._requested_video_model(context.get('model'))
             timeout = float(self.dcfg.get('generation_timeout_minutes', 25)) * 60
             deadline = None
             if resume:
@@ -784,7 +849,10 @@ class BatchGenerationMixin:
                     self.page.goto(target, wait_until='domcontentloaded')
                 else:
                     self.new_chat()
-                self.configure_video_mode()
+                if model is None:
+                    self.configure_video_mode()
+                else:
+                    self.configure_video_mode(model=model)
                 # Never infer a balance from conversation text; use only a
                 # visible, explicitly configured account balance element.
                 self._observe_live_quota_balance(context)
@@ -800,6 +868,9 @@ class BatchGenerationMixin:
                 prompt += '\n' + self._batch_ownership['marker']
                 prompt += '\n此标记仅用于自动化定位，不得出现在生成内容、视频画面、字幕或口播中。'
                 self._batch_sent_prompt = prompt
+                self._require_video_model(model)
+                if model is not None:
+                    print(f'[{self.name}] 已确认豆包视频模型 {MODEL_LABELS[model]}', flush=True)
                 # Persist uncertainty BEFORE the potentially successful click.
                 # The old page URL can still identify the previous chat during
                 # SPA navigation. Save it only after this exact user turn exists.
@@ -1053,6 +1124,7 @@ class BatchGenerationMixin:
                                                  and control.get('task_ids')==task_ids
                                                  for control in baseline.get('controls',[]))
                             if action=='confirm' and len(tasks)==1 and approved and not already_confirmed:
+                                self._wait_followup_composer(deadline)
                                 confirmation='确认，开始生成这条视频。'
                                 controls=list(self._batch_ownership.get('control_texts') or [])
                                 controls.append(confirmation)
@@ -1080,6 +1152,9 @@ class BatchGenerationMixin:
                                           error='已发送一次明确开始生成指令，平台仍要求确认；已停止自动确认，请在原会话人工核对，尚未领取任何未确认产物')
                             return result
                         else:
+                            if known:
+                                self._preserve_followup_video_model(model)
+                            self._wait_followup_composer(deadline)
                             control_phases.add(phase)
                             one_at_time |= action=='single' and not remote_started
                             follow_tasks = missing_tasks[:1] if one_at_time else missing_tasks
@@ -1104,6 +1179,8 @@ class BatchGenerationMixin:
                         and len(known) < len(tasks) and not active):
                     next_task = next(t for t in tasks if t['id'] not in known)
                     if next_task['id'] not in single_followups:
+                        self._preserve_followup_video_model(model)
+                        self._wait_followup_composer(deadline)
                         single_followups.add(next_task['id'])
                         baseline['controls'].append({'phase':'single_next','task_ids':[next_task['id']]})
                         followup = '前一条已经完成。现在仅生成下一条独立视频：\n' + batch_prompt([next_task], context)

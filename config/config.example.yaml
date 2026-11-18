@@ -37,4 +37,5 @@ doubao:
     input_box:
       - 'div[contenteditable="true"]'
 video:
+  model: mini  # Workbench: Seedance 2.0 Mini (mini) or Seedance 2.0 Fast (fast)
   aspect_ratio: '9:16'

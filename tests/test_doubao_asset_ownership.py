@@ -52,6 +52,9 @@ class FixtureAgent(BatchGenerationMixin):
     def _assert_logged_in(self):
         pass
 
+    def _wait_chat_ready(self, **kwargs):
+        pass
+
     def _handle_dialogs(self):
         pass
 
@@ -602,6 +605,7 @@ class AssetOwnershipTests(unittest.TestCase):
     def confirmation_run(self, mode):
         task = dict(id='office#0', seg_index=0, seg_total=1, target_seconds=15,
                     est_seconds=15, start_seconds=0, end_seconds=15, prompt='OFFICE TASK')
+        self.page.goto('https://www.doubao.com/chat/')
         self.page.set_content('')
 
         def send(prompt):

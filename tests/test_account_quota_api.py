@@ -51,6 +51,23 @@ class AccountQuotaApiTests(unittest.TestCase):
         for field in ('used','reserved','unknown','pending_recovery','remaining','estimated','date','blocked_reason'):
             self.assertIn(field,account['quota'])
 
+    def test_model_selection_changes_quota_without_resetting_account_history(self):
+        manager=self.manager('available')
+        manager.reserve('test-account',['task'],'request')
+        manager.mark_submitted('test-account','request')
+        manager.record_generated('test-account','task','request')
+        original=self.store.snapshot()
+        response=self.client.post('/api/accounts/model',json={'model':'fast'})
+        self.assertEqual(response.status_code,200,response.json)
+        listing=self.client.get('/api/accounts').json
+        self.assertEqual(listing['model'],'fast')
+        quota=listing['accounts'][0]['quota']
+        self.assertEqual((quota['limit'],quota['remaining'],quota['blocked_by_model']),(2,0,'mini'))
+        self.assertEqual(self.store.snapshot(),original)
+        confirmed=self.client.post('/api/accounts/confirm',json={'name':'test-account'})
+        self.assertEqual(confirmed.json['quota'],quota)
+        self.assertEqual(self.client.post('/api/accounts/model',json={'model':'invalid'}).status_code,400)
+
     def test_login_window_is_separate_from_exhausted_identity(self):
         manager=self.manager('exhausted')
         manager.observe_remaining('test-account',0)

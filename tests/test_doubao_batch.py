@@ -5,7 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from doubao_automation.doubao_batch import (BatchGenerationMixin,batch_prompt,choose_reply,
@@ -40,6 +40,7 @@ class Agent(BatchGenerationMixin):
     def configure_video_mode(self):pass
     def upload_images(self,_):pass
     def _assert_logged_in(self):pass
+    def _wait_chat_ready(self, **kwargs):pass
     def _handle_dialogs(self):pass
     def type_and_send(self,text):self.sent.append(text)
     def _assistant_text(self):
@@ -132,10 +133,12 @@ class BatchTests(unittest.TestCase):
           'baseline':{'keys':[]},'remote_refs':{self.tasks[0]['id']:ref}})
         self.assertEqual(len(generated),2);self.assertFalse(result['unresolved']);self.assertFalse(agent.sent)
 
-    def resumed_confirmation(self, controls):
+    def resumed_confirmation(self, controls, readiness_error=None):
         task={'id':'script#seg0','script_id':'script','seg_index':0,'seg_total':1,
               'target_seconds':15,'est_seconds':15,'start_seconds':0,'end_seconds':15,'prompt':'original'}
         agent=Agent([[]])
+        if readiness_error:
+            agent._wait_chat_ready=Mock(side_effect=readiness_error)
         owner={'prompt':'original prompt','marker':'【自动化任务标记：request-approved】',
                'chat_path':'/chat/123456789','control_texts':[],'task_ids':[task['id']]}
         owner['original_anchor_proof']=agent._original_anchor_proof(owner,owner['chat_path'])
@@ -158,7 +161,7 @@ class BatchTests(unittest.TestCase):
         submitted=[]
         with patch('doubao_automation.doubao_batch.time.monotonic',side_effect=lambda:agent.page.clock):
             result=agent.run_batch([task],[],{task['id']:self.dests['s#seg0']},
-                {'total_seconds':15,'resume_only':True,'chat_url':agent.page.url,'task_ids':[task['id']],
+                {'total_seconds':15,'model':'mini','resume_only':True,'chat_url':agent.page.url,'task_ids':[task['id']],
                  'original_task_ids':[task['id']],'baseline':baseline},
                 lambda url,value:submitted.append((url,copy.deepcopy(value))),lambda *_:None)
         return agent,result,submitted
@@ -187,6 +190,18 @@ class BatchTests(unittest.TestCase):
         ])
         self.assertEqual(result['error_kind'],'needs_user')
         self.assertEqual(agent.sent,[])
+
+    def test_resume_without_ready_composer_does_not_record_confirmation_dispatch(self):
+        task_id='script#seg0'
+        agent,result,submitted=self.resumed_confirmation(
+            [{'phase':'operator_approved_resume','task_ids':[task_id]}],
+            readiness_error=RuntimeError('等待输入框超时'),
+        )
+        agent._wait_chat_ready.assert_called_once()
+        self.assertIn('等待输入框超时',result['error'])
+        self.assertEqual(agent.sent,[])
+        self.assertFalse(any(control['phase']=='operator_confirmation_dispatched'
+                             for _,value in submitted for control in value['controls']))
     def test_partial_unknown_request_never_automatically_resubmits(self):
         a=asset('https://cdn/one.mp4')
         agent=Agent([[],[a]])
@@ -206,13 +221,36 @@ class BatchTests(unittest.TestCase):
     def test_choice_variants_are_bounded_to_one_control_reply(self):
         agent=Agent([[]],['方案一压缩为15秒，方案二分成两段15秒，请选择',
                           '你希望压缩，还是分成两段？']*8)
-        self.run_agent(agent)
+        # The model was verified on the initial video composer. The formal
+        # conversation then shows only its text composer for clarification.
+        with patch.object(agent, 'configure_video_mode') as configure, \
+             patch.object(agent, '_require_video_model') as verify:
+            self.run_agent(agent, {'model':'mini'})
+        configure.assert_called_once_with(model='mini')
+        verify.assert_called_once_with('mini')
         self.assertEqual(len(agent.sent),2)
         self.assertIn('选择分段',agent.sent[1]);self.assertNotIn('【完整剧本',agent.sent[1])
+    def test_followup_fails_before_dispatch_when_composer_moves_to_other_chat(self):
+        agent=Agent([[]],['请确认后开始生成'])
+        def open_other_chat(**kwargs):
+            agent.page.url='https://www.doubao.com/chat/987654321'
+        agent._wait_chat_ready=Mock(side_effect=open_other_chat)
+        result,_,submitted=self.run_agent(agent)
+        agent._wait_chat_ready.assert_called_once()
+        self.assertIn('已离开原对话', result['error'])
+        self.assertEqual(len(agent.sent),1)
+        self.assertFalse(any(baseline['controls'] for _,baseline in submitted))
+
     def test_explicit_single_limit_sends_only_missing_second_segment(self):
         a,b=asset('https://cdn/one.mp4'),asset('https://cdn/two.mp4',1)
         agent=Agent([[],[],[a],[a,b]],['一次只能生成一条视频','第一条已经生成完成'])
-        result,generated,_=self.run_agent(agent)
+        absent_control = Mock()
+        absent_control.count.return_value = 0
+        agent.page.get_by_role = Mock(return_value=absent_control)
+        with patch.object(agent, 'configure_video_mode'), patch.object(agent, '_require_video_model') as verify:
+            result,generated,_=self.run_agent(agent, {'model':'fast'})
+        verify.assert_called_once_with('fast')
+        agent.page.get_by_role.assert_called_once()
         self.assertEqual(len(generated),2);self.assertEqual(len(agent.sent),3)
         self.assertIn('视频2/4',agent.sent[-1]);self.assertFalse(result['unresolved'])
     def test_prompt_preserves_full_length_and_only_two_windows(self):

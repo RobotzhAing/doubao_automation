@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 from .config import get
 from .doubao_batch import (BatchGenerationMixin, generation_unavailable_matches,
                            quota_exhaustion_matches)
+from .seedance_models import MINI
 
 
 class NeedsLogin(Exception):
@@ -676,21 +677,14 @@ class DoubaoAgent(BatchGenerationMixin):
     def run_task(self, prompt_text: str, image_paths: list, dest: Path) -> Path:
         self.open_chat()
         self.new_chat()
-        if get(self.cfg, "doubao.use_video_skill", False):
-            try:
-                skill_name = get(self.cfg, "doubao.video_skill_name", "视频生成")
-                btn = self.page.get_by_role("button", name=skill_name).first
-                if btn.count() > 0 and btn.is_visible():
-                    btn.click(timeout=4000)
-                    self.page.wait_for_timeout(1200)
-                    print(f"[{self.name}] 已点击「{skill_name}」技能按钮")
-            except Exception as e:
-                print(f"[{self.name}] 点击视频技能失败（忽略，走自动路由）: {e}")
+        model = self._requested_video_model() or MINI
+        self.configure_video_mode(model=model)
         self.upload_images(image_paths)
         try:
             self._quota_assistant_before = self._assistant_text()
         except Exception:
             self._quota_assistant_before = None
+        self._require_video_model(model)
         self.type_and_send(prompt_text)
         return self.wait_result(Path(dest))
 

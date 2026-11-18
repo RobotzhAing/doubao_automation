@@ -144,7 +144,7 @@ python run_pipeline.py inspect-gemini
 - **某账号被标记 needs_login**：重跑 `python run_login.py --account doubao2` 登录后，
   `python run_pipeline.py run` 自动续跑。
 - **额度跨天恢复**：耗尽账号次日自动回到可用池，无需手工干预。
-- **批次与额度**：当前按账号依次执行，每批最多两条、每账号每天最多四条；余额为零后切换已登录账号。
+- **批次与额度**：在「账号库」选择 Seedance 2.0 Mini 或 Fast。按北京时间计算，每账号 Mini 每日最多 4 条，Fast 最多 2 条。同账号当天使用其中一个模型后，另一个模型的剩余额度为 0。每批最多两条，额度为 0 时跳过该账号。
   已提交但结果未知的请求只恢复原对话，不能通过重新登录补回次数。
 
 ## 已知边界

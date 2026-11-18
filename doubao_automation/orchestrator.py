@@ -23,6 +23,7 @@ from .gemini_web import (GeminiError, GeminiNotLoggedIn, GeminiResponseRejected,
 from .paths import (FRAMES_DIR, ROOT, SCRIPTS_DIR, STATE_DIR, VIDEOS_DIR,
                     ensure_dirs, resolve, safe_filename)
 from .script_splitter import build_segments, parse_scripts, detect_total_seconds
+from .seedance_models import MINI, normalize_model
 from .state import JsonStore
 from .video_utils import concat_videos, extract_last_frame, find_ffmpeg
 from .video_archive import publish_finished
@@ -70,11 +71,12 @@ def build_script_prompt(cfg, snapshot, source):
 class Pipeline:
     def __init__(self, cfg: dict):
         self.cfg = cfg
+        self.model = normalize_model(get(cfg, 'video.model', MINI))
         ensure_dirs()
         self.store = JsonStore(STATE_DIR / "pipeline_state.json", initial=_INITIAL)
         names = [a["name"] for a in (get(cfg, "accounts.doubao") or []) if a.get("enabled", True)]
         self.account_names = names
-        self.accounts = AccountManager(JsonStore(STATE_DIR / "accounts.json"), names)
+        self.accounts = AccountManager(JsonStore(STATE_DIR / "accounts.json"), names, model=self.model)
         self.cond = threading.Condition()
         self.ffmpeg = None  # 延迟初始化，避免未用到视频的 stage 也要求 ffmpeg
         self._attempted_requests = set()
@@ -403,15 +405,16 @@ class Pipeline:
                     continue
                 task_id=task_ids[0]
                 script_id=task_id.rsplit('#seg',1)[0]
+                model=normalize_model(saved.get('model',MINI))
                 task=dict(id=task_id,script_id=script_id,seg_index=0,seg_total=1,
                           prompt='',narration='',est_seconds=float(duration),target_seconds=float(duration),
                           start_seconds=0,end_seconds=float(duration),product_images=[],status='awaiting_result',
                           account=account,attempts=1,cloud_attempts=1,local_attempts=0,video='',error='',
-                          request_id=request_id,raw_video='',remote_ref={})
+                          request_id=request_id,model=model,raw_video='',remote_ref={})
                 request=dict(request_id=request_id,account=account,task_ids=list(task_ids),
                              original_task_ids=list(task_ids),script_id=script_id,phase='unknown',
                              submitted=True,chat_url=saved.get('chat_url',''),
-                             baseline=baseline,continuation_safe=False)
+                             baseline=baseline,continuation_safe=False,model=model)
                 found.append((request_id,task,request))
         if {item[0] for item in found}!=set(selected) or len(found)!=len(selected):
             raise RuntimeError('部分原请求缺少有效的提交账本或原会话证明；未恢复任何新生成任务')
@@ -447,6 +450,7 @@ class Pipeline:
                 record=self.accounts.find_task(task['id'])
                 if record:
                     rid=record['request_id'];saved=record['request']
+                    model=normalize_model(saved.get('model',MINI))
                     entries=self.accounts.request(record['account'],rid).get('entries',{})
                     active_ids=[tid for tid in saved['task_ids']
                                 if entries.get(tid,{}).get('state') not in ('cancelled','rejected')]
@@ -458,6 +462,7 @@ class Pipeline:
                     request.setdefault('request_id',rid)
                     request.setdefault('account',record['account'])
                     request.setdefault('original_task_ids',list(saved['task_ids']))
+                    request['model']=model
                     if saved.get('refunded_task_ids'):
                         request['refunded_task_ids']=list(saved['refunded_task_ids'])
                     request['task_ids']=active_ids
@@ -465,7 +470,7 @@ class Pipeline:
                     if saved.get('submitted'):
                         request.update(submitted=True,chat_url=saved.get('chat_url') or request.get('chat_url',''),
                                        baseline=saved.get('baseline') or request.get('baseline',{}))
-                    task.update(account=record['account'],request_id=rid)
+                    task.update(account=record['account'],request_id=rid,model=model)
                     if record.get('remote_ref'):task['remote_ref']=record['remote_ref']
                     if (request.get('phase')=='awaiting_user_approval' or saved.get('approval_block')):
                         request.update(phase='awaiting_user_approval',submitted=bool(saved.get('submitted')),
@@ -492,10 +497,13 @@ class Pipeline:
                         if inactive['state']=='cancelled' and not local_failure:
                             task.update(status='needs_user',error='任务取消与提交记录不一致，需核对原请求，不能自动重发')
                             continue
-                        refunded=inactive.get('rejection',{}).get('kind')=='generation_failed_refunded'
-                        if (inactive['state']=='rejected' and not refunded and inactive['account'] in self.accounts.names
+                        rejection_kind=inactive.get('rejection',{}).get('kind')
+                        refunded=rejection_kind=='generation_failed_refunded'
+                        if (inactive['state']=='rejected' and rejection_kind in (None,'quota')
+                                and inactive['account'] in self.accounts.names
                                 and inactive['date']==self.accounts.quota(inactive['account'])['date']):
-                            self.accounts.mark_exhausted(inactive['account'],'最新回复明确拒绝了该批额度')
+                            self.accounts.mark_exhausted(inactive['account'],'最新回复明确拒绝了该批额度',
+                                                         request_id=inactive['request_id'])
                         attempts,local=self._retry_counts(task,stats,refund_gap=refunded and old==inactive['request_id'])
                         exhausted=attempts>=int(get(self.cfg,'doubao.max_attempts_per_task',3))
                         task.update(status='failed' if exhausted else 'pending',attempts=attempts,cloud_attempts=attempts,
@@ -587,13 +595,14 @@ class Pipeline:
                 if any(not 0<float(t['target_seconds'])<=15 for t in batch):
                     raise ValueError('每个视频的目标时长必须大于0且不超过15秒')
                 rid='request_'+uuid.uuid4().hex
-                self.accounts.reserve(account,[t['id'] for t in batch],rid)
+                reservation=self.accounts.reserve(account,[t['id'] for t in batch],rid)
+                model=normalize_model(reservation.get('model',MINI))
                 previous=[r for r in requests.values() if r.get('script_id')==first['script_id'] and r.get('account')==account
-                          and r.get('phase')=='complete' and r.get('continuation_safe')]
+                          and r.get('phase')=='complete' and r.get('continuation_safe') and r.get('model',MINI)==model]
                 requests[rid]=dict(request_id=rid,account=account,task_ids=[t['id'] for t in batch],
-                                   script_id=first['script_id'],phase='reserved',submitted=False,
+                                   script_id=first['script_id'],phase='reserved',submitted=False,model=model,
                                    chat_url=previous[-1].get('chat_url','') if previous else '',baseline={},continuation_safe=False)
-                for task in batch:task.update(status='reserved',account=account,request_id=rid,error='')
+                for task in batch:task.update(status='reserved',account=account,request_id=rid,model=model,error='')
                 return [dict(t) for t in batch]
 
     def _claim(self, account):
@@ -688,6 +697,7 @@ class Pipeline:
         requests = self.store.snapshot().get('requests', {})
         request = requests.get(rid, {}) if recovering else requests[rid]
         ledger=self.accounts.request(account,rid)
+        model=normalize_model(ledger.get('model',MINI) if ledger else request.get('model',MINI))
         if recovering:
             # A short recovery has no route into an unsent reservation, even
             # if a journal or account changes after candidate selection.
@@ -716,7 +726,7 @@ class Pipeline:
             return False
         script_tasks=[t for t in self.store.snapshot().get('tasks',[]) if t['script_id']==tasks[0]['script_id']]
         context=dict(script_text=script.get('text',''),total_seconds=sum(float(t['target_seconds']) for t in script_tasks),
-                     chat_url=request.get('chat_url',''),request_id=rid,baseline=request.get('baseline',{}),
+                     chat_url=request.get('chat_url',''),request_id=rid,baseline=request.get('baseline',{}),model=model,
                      task_ids=ids,original_task_ids=list(request.get('original_task_ids') or ledger.get('task_ids') or ids),
                      remote_refs={t['id']:t['remote_ref'] for t in tasks
                                                if _valid_remote_ref(t.get('remote_ref'))},resume_only=submitted)
@@ -732,9 +742,9 @@ class Pipeline:
         dests={t['id']:VIDEOS_DIR/f"{t['script_id']}_seg{t['seg_index']}.raw.mp4" for t in tasks}
 
         def on_quota_remaining(count):
-            self.accounts.observe_remaining(account,count)
+            self.accounts.observe_remaining(account,count,request_id=rid)
             if not context['resume_only']:
-                q=self.accounts.quota(account)
+                q=self.accounts.quota(account,model=model)
                 if count==0:raise QuotaExhausted('平台明确显示剩余额度为0')
                 if q['used']+q['reserved']+q['unknown']>q['limit']:
                     raise GenerationFailed('平台余额少于本批次，请先释放预留再缩小批次')
@@ -779,7 +789,7 @@ class Pipeline:
             return False
         if not recovering and isinstance(result.get('quota_remaining'),int):
             # Observation after submission is accounting-only; it cannot cancel an accepted request.
-            self.accounts.observe_remaining(account,result['quota_remaining'])
+            self.accounts.observe_remaining(account,result['quota_remaining'],request_id=rid)
         for tid,ref in result.get('remote_refs',{}).items():
             if tid in ids and _valid_remote_ref(ref):on_generated(tid,ref)
         for task in tasks:
@@ -873,7 +883,7 @@ class Pipeline:
                 unresolved=[tid for tid in unresolved if tid not in released]
             if not unresolved:
                 with self.store.txn() as data:data['requests'][rid]['phase']='rejected'
-                self.accounts.mark_exhausted(account,error)
+                self.accounts.mark_exhausted(account,error,request_id=rid)
                 return False
         if not recovering and submitted and kind=='not_generated' and result.get('continuation_safe') is True:
             try:
@@ -926,7 +936,7 @@ class Pipeline:
                         task.update(status='pending',request_id='',account='',attempts=cloud,cloud_attempts=cloud,
                                     local_attempts=int(task.get('local_attempts',0))+1,local_blocked=blocked,
                                     failure_phase='before_submit',error=error)
-        if kind=='quota' and not recovering:self.accounts.mark_exhausted(account,error)
+        if kind=='quota' and not recovering:self.accounts.mark_exhausted(account,error,request_id=rid)
         elif kind=='login':self.accounts.mark_needs_login(account,error)
         return ((bool(refunded) and not self.accounts.quota(account)['unknown'])
                 or bool(not_generated_released)

@@ -24,6 +24,7 @@ from doubao_automation.account_manager import AccountManager
 from doubao_automation.orchestrator import Pipeline
 from doubao_automation.doubao_batch import BatchGenerationMixin, formal_doubao_chat_path
 from doubao_automation.config import DEFAULT_CONFIG_PATH, load_config, require_doubao_accounts, save_config
+from doubao_automation.seedance_models import MINI, MODEL_LIMITS, normalize_model
 from doubao_automation.doubao_login import probe_doubao_login, session_pages
 from doubao_automation.caption_context import (caption_source, caption_images, caption_videos, caption_target,
                                                caption_entry, row_captions, put_caption, link_caption,
@@ -136,13 +137,14 @@ class _ReadOnlyStore:
         return copy.deepcopy(self.data)
 
 
-def readonly_account_manager(names):
+def readonly_account_manager(names, model=MINI):
     data = readonly_snapshot(STATE_DIR / 'accounts.json')
     accounts = data.setdefault('accounts', {})
     for name in names:
         accounts.setdefault(name, dict(status='needs_login', note='尚未验证登录', date=''))
     manager = AccountManager.__new__(AccountManager)
-    manager.store, manager.names, manager.daily_limit = _ReadOnlyStore(data), list(names), 4
+    manager.store, manager.names = _ReadOnlyStore(data), list(names)
+    manager.model, manager.daily_limit = model, MODEL_LIMITS[model]
     manager.clock = lambda: datetime.datetime.now(datetime.timezone.utc)
     return manager
 
@@ -217,6 +219,11 @@ def home():
                         '<button class="btn red" onclick="stop()">停止</button>'
                         '<button class="btn gray" onclick="previewClearHistory()">预览历史清理</button>'
                         '<button id="archive-run" class="btn red" onclick="archiveStoppedRun()" disabled>删除已停止的旧任务</button>')
+    html = html.replace('<h1>豆包账号库</h1>',
+                        '<h1>豆包账号库</h1>'
+                        '<p><label>视频生成模型 <select id="seedanceModel" onchange="changeSeedanceModel(this)" disabled>'
+                        '<option value="mini">Seedance 2.0 Mini</option>'
+                        '<option value="fast">Seedance 2.0 Fast</option></select></label></p>')
     return render_template_string(html, csrf_token=CSRF_TOKEN)
 
 
@@ -1009,17 +1016,18 @@ def archive_stopped_run():
 def _savecfg(cfg):
     save_config(cfg,DEFAULT_CONFIG_PATH)
 
-def account_manager(names=()):
+def account_manager(names=(), model=MINI):
     state=JsonStore(STATE_DIR/'accounts.json')
     with state.txn() as data:
         accounts=data.setdefault('accounts',{})
         for name in names:
             accounts.setdefault(name,dict(status='needs_login',note='尚未验证登录',date=''))
-    return AccountManager(state,list(names))
+    return AccountManager(state,list(names),model=model)
 
 
 def account_status(name,status,note=''):
-    manager=account_manager([name])
+    cfg=load_config()
+    manager=account_manager([name],model=normalize_model((cfg.get('video') or {}).get('model')))
     if status=='available':
         manager.mark_available_after_login(name)
         # A verified login must not overwrite exhaustion or an explicit disable.
@@ -1037,8 +1045,11 @@ def account_quota(manager,name,state=None):
 @app.get('/api/accounts')
 def account_list():
     with lock:
-        items=load_config().get('accounts',{}).get('doubao',[])
-        manager=readonly_account_manager([a['name'] for a in items])
+        cfg=load_config()
+        items=cfg.get('accounts',{}).get('doubao',[])
+        model=normalize_model((cfg.get('video') or {}).get('model'))
+        model_locked=running()
+        manager=readonly_account_manager([a['name'] for a in items],model)
         out=[]
         for a in items:
             name=a['name']; state=manager.status(name); job=pending_accounts.get(name,{})
@@ -1059,7 +1070,30 @@ def account_list():
                             account_window_open=visiting and alive,
                             account_window_status=visit_status,
                             account_window_note=job.get('note','') if visit_status else ''))
-    return jsonify(accounts=out)
+    return jsonify(accounts=out,model=model,model_locked=model_locked)
+
+
+@app.post('/api/accounts/model')
+def account_video_model():
+    body=request.get_json(silent=True)
+    if not isinstance(body,dict) or not isinstance(body.get('model'),str):
+        raise ValueError('请选择视频生成模型')
+    model=normalize_model(body['model'])
+    with lock:
+        require_idle()
+        runner=Pipeline.__new__(Pipeline)
+        runner.store=store()
+        try:
+            with runner._run_lock():
+                cfg=load_config()
+                video=cfg.get('video') or {}
+                if video.get('model')!=model:
+                    video['model']=model
+                    cfg['video']=video
+                    _savecfg(cfg)
+        except RuntimeError:
+            return jsonify(error='流水线正在运行，请在结束后切换视频模型'),409
+    return jsonify(model=model,model_locked=False)
 
 def visible_account_browser_config():
     cfg=copy.deepcopy(load_config())
@@ -1268,7 +1302,8 @@ def account_visit():
 @app.post('/api/accounts/confirm')
 def confirm():
     name=request.get_json(force=True).get('name')
-    manager=account_manager()
+    cfg=load_config()
+    manager=account_manager(model=normalize_model((cfg.get('video') or {}).get('model')))
     status=manager.status(name); quota=account_quota(manager,name,status)
     if status.get('status') in ('available','busy','exhausted'):
         label={'available':'已登录','busy':'账号正在运行','exhausted':'今日额度耗尽'}[status['status']]

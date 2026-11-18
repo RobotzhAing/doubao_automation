@@ -19,21 +19,28 @@ const quota = {date:'2026-10-31',timezone:'Asia/Shanghai',limit:4,used:1,reserve
 let rows = [{name,enabled:true,status:'needs_login',note:'请登录 <safe>',quota:structuredClone(quota)}];
 const requests = [], confirmations = [], delayedLists = [];
 let delayList = false, actionGate, rejectAction = false, confirmAnswer = false;
+let model = 'mini', modelLocked = false;
+const accountList = () => ({model,model_locked:modelLocked,accounts:structuredClone(rows)});
 const state = {rows:[],requested_script_count:1,running:false,returncode:null};
 const context = vm.createContext({document:{querySelector:element,activeElement:null},FormData:class {},console,
   setInterval(fn){interval=fn;},confirm(text){confirmations.push(text);return confirmAnswer;},
   fetch:async(path,options={})=>{
     requests.push({path,options});
     if(path==='/api/accounts' && delayList) {
-      const captured = structuredClone(rows);
+      const captured = accountList();
       await new Promise(resolve=>delayedLists.push(resolve));
-      return {ok:true,json:async()=>({accounts:captured})};
+      return {ok:true,json:async()=>captured};
     }
     if(path.startsWith('/api/accounts/') && actionGate) await actionGate;
     const failed = path.startsWith('/api/accounts/') && rejectAction;
     return {ok:!failed,status:failed?400:200,statusText:'failed',json:async()=>{
       if(path==='/api/state') return structuredClone(state);
-      if(path==='/api/accounts') return {accounts:structuredClone(rows)};
+      if(path==='/api/accounts') return accountList();
+      if(path==='/api/accounts/model' && !failed) {
+        model = JSON.parse(options.body).model;
+        rows[0].quota={...quota,limit:2,used:0,reserved:0,unknown:0,remaining:0,blocked_reason:'今日已使用 Seedance 2.0 Mini'};
+        return {model,model_locked:modelLocked};
+      }
       if(path.startsWith('/api/accounts/')) return failed?{error:'仍需登录 <retry>'}:{ok:true,name,message:'账号状态已检查，余额未重置'};
       return {ok:true};
     }};
@@ -108,10 +115,38 @@ function posts(){return requests.filter(r=>r.options.method==='POST');}
   const count=posts().length;await context.deleteAccount(button);
   assert.equal(posts().length,count,'cancelled account deletion sends no request');
   assert.ok(confirmations[0].includes(name));
+  const modelSelect=element('#seedanceModel');
+  assert.equal(modelSelect.value,'mini');
+  assert.equal(modelSelect.disabled,false);
+  delayList=true;const staleModelList=context.loadAccounts();delayList=false;
+  let finishModel;actionGate=new Promise(resolve=>{finishModel=resolve;});
+  modelSelect.value='fast';
+  const pendingModel=context.changeSeedanceModel(modelSelect);
+  assert.equal(modelSelect.disabled,true,'selector is disabled while saving');
+  await context.changeSeedanceModel(modelSelect);
+  await context.run();
+  assert.equal(posts().filter(r=>r.path==='/api/accounts/model').length,1,'one model change is written');
+  assert.match(element('#log').textContent,/正在保存视频生成模型/);
+  finishModel();await pendingModel;actionGate=null;
+  delayedLists.shift()();await staleModelList;
+  assert.equal(modelSelect.value,'fast','stale Mini poll cannot restore the old selection');
+  assert.equal(modelSelect.disabled,false);
+  assert.match(html(),/今日已使用 0\/2/);
+  assert.match(html(),/今日剩余 0 次/);
+  assert.match(html(),/今日已使用 Seedance 2\.0 Mini/);
+  assert.deepEqual(JSON.parse(posts().at(-1).options.body),{model:'fast'});
+  rejectAction=true;modelSelect.value='mini';await context.changeSeedanceModel(modelSelect);rejectAction=false;
+  assert.equal(modelSelect.value,'fast','saving failure restores the server-selected model');
+  assert.match(element('#log').textContent,/切换模型失败/);
+  modelLocked=true;await context.loadAccounts();
+  assert.equal(modelSelect.disabled,true);
+  modelSelect.value='mini';await context.changeSeedanceModel(modelSelect);
+  assert.equal(modelSelect.value,'fast');
+  assert.equal(posts().filter(r=>r.path==='/api/accounts/model').length,2,'locked model cannot submit');
   rows=[{name:'legacy',enabled:false,status:'needs_login'}];await context.loadAccounts();
   assert.match(html(),/每日次数统计暂不可用/);assert.doesNotMatch(html(),/今日剩余 4/);
   element('#accounts').style.display='';interval();await new Promise(resolve=>setImmediate(resolve));
   assert.ok(requests.filter(r=>r.path==='/api/accounts').length>5);
   assert.ok(!posts().some(r=>r.path==='/api/run'),'tests never generate videos');
-  console.log('Account UI: quota categories, identity/estimate labels, safe names, stale polls, action gating and cancellation passed');
+  console.log('Account UI: quota categories, stale polls, action gating, and model selection passed');
 })().catch(error=>{console.error(error);process.exitCode=1;});

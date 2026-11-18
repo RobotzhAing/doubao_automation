@@ -4,6 +4,8 @@ let captionRecognition = false, captionRequests = 0, stateFetchSequence = 0, sou
 const accountPending = new Map(), accountFeedback = new Map();
 const openingLoginAccounts = new Set(), openingAccountWindows = new Set();
 let accountFetchSequence = 0, accountMarkup = '', accountAddPending = false;
+const seedanceModelLabels = {mini:'Seedance 2.0 Mini', fast:'Seedance 2.0 Fast'};
+let accountVideoModel = '', accountModelLocked = true, accountModelSaving = false;
 const videoFolderFeedback = new Map(), videoApprovalErrors = new Map(), videoApprovalPending = new Set(), videoApprovalJobs = new Map();
 const videoDeleteFeedback = new Map(), videoDeletePending = new Set();
 let videoRows = [], videoFetchSequence = 0, videoMarkup = '';
@@ -511,6 +513,7 @@ async function upload() {
 }
 async function run() {
   try {
+    if (accountModelSaving) throw Error('正在保存视频生成模型，请稍候再运行');
     if (captionRequests) throw Error('素材描述操作正在进行，请稍候再运行');
     const current = await api('/api/state');
     const pendingEdits = dirty;
@@ -551,11 +554,46 @@ async function archiveStoppedRun() {
 async function deleteRow(target) { const id = typeof target === 'string' ? target : target.dataset.recordId; if (!confirm('从当前工作台移除此记录？飞书记录会在下次同步时恢复。')) return; try { msg(await api('/api/rows/delete',{record_id:id})); dirty=false; await refresh(); } catch(e) { msg(e.message); } }
 const accountLabels = {available:'已登录，可运行', busy:'运行中', checking:'正在验证登录', needs_login:'待登录', exhausted:'今日额度耗尽', disabled:'不可用', opening:'正在打开浏览器', error:'浏览器启动失败'};
 const accountWindowLabels = {opening:'正在打开账号窗口…', open:'账号窗口已打开', error:'账号窗口启动失败，请重试并查看启动日志'};
-async function loadAccounts() {
+function renderSeedanceModel() {
+  const select = document.querySelector('#seedanceModel');
+  if (!select) return;
+  if (accountVideoModel) select.value = accountVideoModel;
+  select.disabled = accountModelSaving || accountModelLocked || !accountVideoModel;
+}
+async function changeSeedanceModel(target) {
+  const model = target.value;
+  if (accountModelSaving) return;
+  if (accountModelLocked || !accountVideoModel || !Object.hasOwn(seedanceModelLabels, model)) {
+    renderSeedanceModel();
+    return;
+  }
+  if (model === accountVideoModel) return;
+  accountModelSaving = true;
+  ++accountFetchSequence;
+  target.disabled = true;
+  try {
+    const result = await api('/api/accounts/model',{model});
+    if (!Object.hasOwn(seedanceModelLabels, result.model)) throw Error('工作台未返回已保存的模型');
+    accountVideoModel = result.model;
+    msg('视频生成模型已切换为 '+seedanceModelLabels[accountVideoModel]);
+  } catch(e) {
+    msg('切换模型失败：'+e.message);
+  } finally {
+    renderSeedanceModel();
+    try { await loadAccounts({afterModelSave:true}); }
+    catch(e) { refreshFailed('账号',e); }
+    finally { accountModelSaving = false; renderSeedanceModel(); }
+  }
+}
+async function loadAccounts({afterModelSave = false} = {}) {
+  if (accountModelSaving && !afterModelSave) return;
   const sequence = ++accountFetchSequence;
   const result = await api('/api/accounts');
   if (sequence !== accountFetchSequence) return;
   refreshRecovered('账号');
+  accountVideoModel = Object.hasOwn(seedanceModelLabels, result.model) ? result.model : '';
+  accountModelLocked = result.model_locked === true;
+  renderSeedanceModel();
   const priorWindows = new Map(accounts.filter(a => a.account_window_open).map(a => [a.name,a.account_window_status]));
   accounts = result.accounts || [];
   for (const a of accounts) {

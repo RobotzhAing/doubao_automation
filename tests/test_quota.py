@@ -34,9 +34,9 @@ class QuotaTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def new_manager(self):
+    def new_manager(self, model='mini'):
         return AccountManager(JsonStore(self.path), ['a', 'b'], daily_limit=4,
-                              clock=self.clock)
+                              clock=self.clock, model=model)
 
     def charge(self, task_id, request_id, manager=None):
         manager = manager or self.manager
@@ -57,6 +57,88 @@ class QuotaTests(unittest.TestCase):
         self.assertEqual(quota['date'], '2026-10-30')
         self.assertEqual(quota['limit'], 4)
         self.assertIs(quota['estimated'], True)
+
+    def test_each_model_has_its_own_cap_and_blocks_the_other_after_use(self):
+        fast = self.new_manager('fast')
+        self.assertEqual((fast.quota('a')['limit'], fast.quota('a')['remaining']), (2, 2))
+        self.charge('fast-1', 'fast-request-1', fast)
+        self.assertEqual(fast.request('a', 'fast-request-1')['model'], 'fast')
+        self.assertEqual(fast.find_task('fast-1')['model'], 'fast')
+        self.assertEqual(fast.quota('a')['remaining'], 1)
+        mini_a = self.manager.quota('a')
+        self.assertEqual((mini_a['limit'], mini_a['remaining'], mini_a['blocked_by_model']), (4, 0, 'fast'))
+        with self.assertRaisesRegex(ValueError, '今日已使用或预留'):
+            self.manager.reserve('a', ['mini-on-a'], 'mini-blocked')
+
+        self.charge('fast-2', 'fast-request-2', fast)
+        self.assertEqual(fast.quota('a')['used'], 2)
+        with self.assertRaisesRegex(ValueError, '剩余额度不足'):
+            fast.reserve('a', ['fast-3'], 'fast-request-3')
+
+        self.manager.reserve('b', ['mini-on-b'], 'mini-request')
+        self.manager.mark_submitted('b', 'mini-request')
+        self.manager.record_generated('b', 'mini-on-b', 'mini-request')
+        self.assertEqual((fast.quota('b')['remaining'], fast.quota('b')['blocked_by_model']), (0, 'mini'))
+        self.assertEqual(self.manager.quota('b')['remaining'], 3)
+
+        self.clock.value += timedelta(days=1)
+        self.assertEqual((self.manager.quota('a')['remaining'], fast.quota('a')['remaining']), (4, 2))
+
+    def test_reservations_and_unknown_submissions_hold_model_until_reconciled(self):
+        fast = self.new_manager('fast')
+        fast.reserve('a', ['fast-task'], 'fast-unsubmitted')
+        self.assertEqual(self.manager.quota('a')['remaining'], 0)
+        fast.release_unsubmitted('a', 'fast-unsubmitted')
+        self.assertEqual(self.manager.quota('a')['remaining'], 4)
+
+        fast.reserve('a', ['fast-task'], 'fast-unknown')
+        # A restarted manager viewing the opposite model still recovers and
+        # attributes the exact original request to Fast.
+        self.manager.mark_submitted('a', 'fast-unknown')
+        self.manager.mark_unknown('a', 'fast-unknown')
+        self.assertEqual(self.manager.request('a', 'fast-unknown')['model'], 'fast')
+        self.assertEqual(fast.quota('a')['unknown'], 1)
+        self.assertEqual(self.manager.quota('a')['remaining'], 0)
+        self.manager.release_failed_refunded('a', 'fast-unknown', ['fast-task'],
+                                             self.refunded_proof('fast-task'))
+        self.assertEqual(self.manager.quota('a')['remaining'], 4)
+
+    def test_concurrent_reservations_cannot_lock_one_account_to_both_models(self):
+        fast = self.new_manager('fast')
+        barrier = threading.Barrier(2)
+
+        def reserve(manager):
+            barrier.wait(timeout=3)
+            try:
+                return manager.reserve('a', [manager.model + '-task'], manager.model + '-request')
+            except ValueError:
+                return None
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(reserve, [self.manager, fast]))
+        accepted = [request for request in results if request]
+        self.assertEqual(len(accepted), 1)
+        winner = accepted[0]['model']
+        loser = fast if winner == 'mini' else self.manager
+        self.assertEqual((loser.quota('a')['remaining'], loser.quota('a')['blocked_by_model']), (0, winner))
+
+    def test_legacy_same_day_ledger_and_observations_are_mini(self):
+        self.charge('legacy-task', 'legacy-request')
+        day = self.manager.quota('a')['date']
+        with self.manager.store.txn() as data:
+            account = data['accounts']['a']
+            account['quota_requests']['legacy-request'].pop('model')
+            account['quota_days'][day]['entries']['legacy-request:legacy-task'].pop('model')
+        fast = self.new_manager('fast')
+        self.assertEqual(fast.request('a', 'legacy-request')['model'], 'mini')
+        self.assertEqual(fast.find_task('legacy-task')['model'], 'mini')
+        fast.observe_remaining('a', 2, request_id='legacy-request')
+        self.assertEqual(self.manager.quota('a')['used'], 2)
+        self.assertEqual((fast.quota('a')['used'], fast.quota('a')['remaining']), (0, 0))
+
+        self.clock.value += timedelta(days=1)
+        fast.observe_remaining('a', 0, request_id='legacy-request')
+        self.assertEqual((self.manager.quota('a')['remaining'], fast.quota('a')['remaining']), (4, 2))
 
     def test_legacy_composer_startup_failure_is_recovered_but_other_disables_are_preserved(self):
         legacy = Path(self.tmp.name) / 'disabled-legacy.json'

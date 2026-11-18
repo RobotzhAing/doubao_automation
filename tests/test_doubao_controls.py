@@ -124,6 +124,41 @@ class DurationControlTests(unittest.TestCase):
         self.assertEqual(self.page.locator('#option').get_attribute('data-clicked'),'1')
         self.assertEqual(self.page.locator('#duration').inner_text(),'9:16 · 8s')
 
+    def show_model_controls(self, *, apply_selection=True):
+        self.page.set_content('''
+          <button id="model" aria-haspopup="menu">模型 Seedance 2.0 Mini</button>
+          <div id="model-options" role="menu" aria-labelledby="model" hidden>
+            <div data-model="Seedance 2.0">Seedance 2.0</div>
+            <div data-model="Seedance 2.0 Fast">Seedance 2.0 Fast 快速出片选择</div>
+            <div data-model="Seedance 2.0 Mini"><span>Seedance 2.0 Mini</span><span>日常生成使用</span></div>
+          </div>
+          <button>9:16 · 15s</button>''')
+        self.page.evaluate('''applySelection => {
+          const model = document.querySelector('#model');
+          const menu = document.querySelector('#model-options');
+          model.onclick = () => menu.hidden = false;
+          menu.onclick = event => {
+            const option = event.target.closest('[data-model]');
+            menu.hidden = true;
+            if (applySelection) model.textContent = '模型 ' + option.dataset.model;
+          };
+        }''', apply_selection)
+
+    def test_model_selection_reads_back_exact_fast_and_mini_labels(self):
+        self.show_model_controls()
+        agent = ControlAgent(self.page)
+        agent.configure_video_mode(model='fast')
+        self.assertEqual(self.page.locator('#model').inner_text(), '模型 Seedance 2.0 Fast')
+        agent.configure_video_mode(model='mini')
+        self.assertEqual(self.page.locator('#model').inner_text(), '模型 Seedance 2.0 Mini')
+        self.assertEqual(self.page.get_by_role('button', name='9:16 · 15s').count(), 1)
+
+    def test_model_option_click_does_not_count_without_saved_model_confirmation(self):
+        self.show_model_controls(apply_selection=False)
+        with self.assertRaisesRegex(RuntimeError, '未能确认豆包视频模型为 Seedance 2.0 Fast'):
+            ControlAgent(self.page).configure_video_mode(model='fast')
+        self.assertEqual(self.page.locator('#model').inner_text(), '模型 Seedance 2.0 Mini')
+
 
 if __name__ == '__main__':
     unittest.main()

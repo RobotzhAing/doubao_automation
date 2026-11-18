@@ -3,6 +3,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import hashlib
 import re
+from .seedance_models import FAST, MINI, MODEL_LABELS, MODEL_LIMITS, normalize_model
 from .state import JsonStore
 
 AVAILABLE='available'
@@ -11,12 +12,15 @@ EXHAUSTED='exhausted'
 NEEDS_LOGIN='needs_login'
 DISABLED='disabled'
 CHINA=timezone(timedelta(hours=8),'Asia/Shanghai')
+HELD_STATES=('reserved','submitted','unknown')
 
 
 class AccountManager:
-    def __init__(self, store: JsonStore, names: list, daily_limit=4, clock=None):
+    def __init__(self, store: JsonStore, names: list, daily_limit=4, clock=None, *, model=MINI):
         self.store,self.names=store,list(names)
-        self.daily_limit=int(daily_limit)
+        self.model=normalize_model(model)
+        self.mini_daily_limit=int(daily_limit)
+        self.daily_limit=self._model_limit(self.model)
         self.clock=clock or (lambda: datetime.now(timezone.utc))
         with self.store.txn() as data:
             for name in self.names:
@@ -45,46 +49,86 @@ class AccountManager:
             acc.update(status=AVAILABLE,note='',date='')
         if (acc.get('status')==EXHAUSTED and acc.get('date')==self._today()
                 and self._today() not in acc.get('quota_days',{})):
-            self._day(acc).update(platform_exhausted=True,observed_remaining=0,estimated=False)
+            model=acc.get('exhausted_model',MINI)
+            self._balance(self._day(acc),model,create=True).update(
+                platform_exhausted=True,observed_remaining=0,estimated=False)
+
+    def _model_limit(self,model):
+        if model==FAST:return MODEL_LIMITS[FAST]
+        return getattr(self,'mini_daily_limit',MODEL_LIMITS[MINI])
 
     def _day(self,acc,day=None):
         return acc.setdefault('quota_days',{}).setdefault(day or self._today(),dict(
-            limit=self.daily_limit,baseline_used=0,estimated=True,entries={},platform_exhausted=False))
+            limit=self._model_limit(MINI),baseline_used=0,estimated=True,entries={},platform_exhausted=False))
+
+    @staticmethod
+    def _balance(day,model,*,create=False):
+        # Existing top-level daily balances were all recorded under Mini.
+        if model==MINI:return day
+        if create:return day.setdefault('model_balances',{}).setdefault(model,{})
+        return day.get('model_balances',{}).get(model,{})
+
+    @staticmethod
+    def _entry_model(acc,entry):
+        request=acc.get('quota_requests',{}).get(entry.get('request_id'),{})
+        return entry.get('model') or request.get('model') or MINI
+
+    @staticmethod
+    def _selected_status(acc,model,today):
+        status=acc.get('status',AVAILABLE)
+        if status==EXHAUSTED and (acc.get('date')!=today or acc.get('exhausted_model',MINI)!=model):
+            return AVAILABLE
+        return status
 
     @staticmethod
     def _entries(acc):
         for day,ledger in acc.get('quota_days',{}).items():
             for key,entry in ledger.get('entries',{}).items():yield day,key,entry
 
-    def _public(self,acc):
+    def _public(self,acc,model=None):
+        model=model or getattr(self,'model',MINI)
+        opposite=MINI if model==FAST else FAST
         today=self._today();day=acc.get('quota_days',{}).get(today,{})
-        limit=int(day.get('limit',self.daily_limit))
+        balance=self._balance(day,model)
+        other_balance=self._balance(day,opposite)
+        limit=self._model_limit(model) if model==FAST else int(balance.get('limit',self._model_limit(model)))
         entries=list(self._entries(acc))
-        today_entries=[entry for entry_day,_,entry in entries if entry_day==today]
-        used=int(day.get('baseline_used',0))+sum(e.get('state')=='charged' for e in today_entries)
+        today_entries=[entry for entry_day,_,entry in entries if entry_day==today
+                       and self._entry_model(acc,entry)==model]
+        blocked_by_model=(int(other_balance.get('baseline_used',0))>0 or other_balance.get('platform_exhausted')
+                          or self._selected_status(acc,opposite,today)==EXHAUSTED
+                          or any(entry_day==today and self._entry_model(acc,entry)==opposite
+                                 and entry.get('state') in (*HELD_STATES,'charged')
+                                 for entry_day,_,entry in entries))
+        used=int(balance.get('baseline_used',0))+sum(e.get('state')=='charged' for e in today_entries)
         reserved=sum(e.get('state')=='reserved' for e in today_entries)
         awaiting_approval=sum(e.get('state')=='reserved' and e.get('awaiting_user_approval') is True
                               for e in today_entries)
         unknown=sum(e.get('state') in ('submitted','unknown') for e in today_entries)
         # Old requests still block new work until reconciled, but their usage
         # belongs to the day they were submitted and must not reduce today's quota.
-        pending_recovery=sum(entry_day!=today and e.get('state') in ('reserved','submitted','unknown')
+        pending_recovery=sum(entry_day!=today and e.get('state') in HELD_STATES
                              for entry_day,_,e in entries)
-        remaining=max(0,limit-used-reserved-unknown);reason='';status=acc.get('status',AVAILABLE)
+        remaining=0 if blocked_by_model else max(0,limit-used-reserved-unknown)
+        reason='';status=self._selected_status(acc,model,today)
         if status==DISABLED:reason='账号已禁用'
         elif status==NEEDS_LOGIN:reason='需要重新登录'
-        elif day.get('platform_exhausted') or (status==EXHAUSTED and acc.get('date')==today):
+        elif blocked_by_model:reason=f'今日已使用或预留 {MODEL_LABELS[opposite]}，当前模型额度为 0'
+        elif balance.get('platform_exhausted') or status==EXHAUSTED:
             remaining,reason=0,'平台提示今日额度已耗尽'
         elif awaiting_approval:reason='等待素材授权确认；保留原请求预留，尚未确认提交'
         elif unknown:reason='已提交产物待核对；仅可恢复原请求'
         elif pending_recovery:reason='历史请求尚未核对；仅可恢复原请求'
         elif remaining==0:reason='今日额度已用完或已预留'
-        return dict(date=today,limit=limit,used=used,reserved=reserved,unknown=unknown,
+        return dict(date=today,model=model,limit=limit,used=used,reserved=reserved,unknown=unknown,
                     awaiting_approval=awaiting_approval,
                     pending_recovery=pending_recovery,remaining=remaining,
-                    estimated=bool(day.get('estimated',True)),blocked_reason=reason)
+                    estimated=bool(balance.get('estimated',True)),blocked_reason=reason,
+                    blocked_by_model=opposite if blocked_by_model else '')
 
-    def quota(self,name):return self._public(self.store.snapshot().get('accounts',{}).get(name,{}))
+    def quota(self,name,*,model=None):
+        model=normalize_model(model) if model is not None else None
+        return self._public(self.store.snapshot().get('accounts',{}).get(name,{}),model)
 
     def status(self,name):
         acc=self.store.snapshot().get('accounts',{}).get(name,{})
@@ -92,6 +136,8 @@ class AccountManager:
         # preceding reset_daily() call. Normalize this snapshot before reporting.
         self._normalize(acc)
         result={k:deepcopy(v) for k,v in acc.items() if k not in ('quota_days','quota_requests')}
+        if acc.get('status')==EXHAUSTED:
+            result['status']=self._selected_status(acc,getattr(self,'model',MINI),self._today())
         result['quota']=self._public(acc)
         return result
 
@@ -106,9 +152,15 @@ class AccountManager:
             acc=self._account(data,name)
             if acc.get('status')==DISABLED:return
             q=self._public(acc)
-            exhausted=self._day(acc).get('platform_exhausted') or q['used']>=q['limit']
-            acc.update(status=EXHAUSTED if exhausted else AVAILABLE,date=self._today() if exhausted else '',
-                       note='今日额度已耗尽' if exhausted else '登录已验证')
+            balance=self._balance(acc.get('quota_days',{}).get(q['date'],{}),self.model)
+            exhausted=balance.get('platform_exhausted') or q['used']>=q['limit']
+            self._record_status(acc,exhausted,'今日额度已耗尽' if exhausted else '登录已验证')
+
+    def _record_status(self,acc,exhausted,note,model=None):
+        acc.update(status=EXHAUSTED if exhausted else AVAILABLE,
+                   date=self._today() if exhausted else '',note=note)
+        if exhausted:acc['exhausted_model']=model or self.model
+        else:acc.pop('exhausted_model',None)
 
     def reserve(self,name,task_ids,request_id):
         task_ids=[str(t) for t in task_ids]
@@ -123,8 +175,12 @@ class AccountManager:
                     raise ValueError('已归档的未知请求不能复用，请创建新的任务编号')
                 if any(e.get('state') in ('cancelled','rejected') for _,_,e in self._entries(acc) if e.get('request_id')==request_id):
                     raise ValueError('已取消的请求不能复用，请使用新的请求编号')
-                return deepcopy(existing)
-            if acc.get('status') not in (AVAILABLE,BUSY):raise ValueError('账号当前不可生成视频')
+                record=deepcopy(existing)
+                record.setdefault('model',MINI)
+                return record
+            today=self._today()
+            if self._selected_status(acc,self.model,today) not in (AVAILABLE,BUSY):
+                raise ValueError('账号当前不可生成视频')
             for other in data.get('accounts',{}).values():
                 if any(e.get('task_id') in task_ids and e.get('state') not in ('cancelled','rejected') for _,_,e in self._entries(other)):
                     raise ValueError('视频任务已有额度记录，应恢复原请求而不是再次提交')
@@ -132,18 +188,24 @@ class AccountManager:
             if quota['pending_recovery']:raise ValueError('账号有未决请求，仅可恢复原请求')
             if quota['unknown']:raise ValueError('账号有未决提交，仅可恢复原请求')
             if quota['awaiting_approval']:raise ValueError('账号有等待授权的原请求，不能创建新请求')
+            if quota['blocked_by_model']:raise ValueError(quota['blocked_reason'])
             if quota['remaining']<len(task_ids):raise ValueError('账号剩余额度不足，不能部分预留此批次')
-            today=self._today();entries=self._day(acc)['entries']
+            entries=self._day(acc,today)['entries']
             for task_id in task_ids:
-                entries[request_id+':'+task_id]=dict(task_id=task_id,request_id=request_id,state='reserved',remote_ref={})
-            record=dict(request_id=request_id,date=today,task_ids=task_ids,chat_url='',baseline={},submitted=False)
+                entries[request_id+':'+task_id]=dict(task_id=task_id,request_id=request_id,model=self.model,
+                                                   state='reserved',remote_ref={})
+            record=dict(request_id=request_id,date=today,model=self.model,task_ids=task_ids,
+                        chat_url='',baseline={},submitted=False)
             requests[request_id]=record
             return deepcopy(record)
 
     def request(self,name,request_id):
         acc=self.store.snapshot().get('accounts',{}).get(name,{})
         record=deepcopy(acc.get('quota_requests',{}).get(request_id,{}))
-        if record:record['entries']={e['task_id']:deepcopy(e) for _,_,e in self._entries(acc) if e.get('request_id')==request_id}
+        if record:
+            record.setdefault('model',MINI)
+            record['entries']={e['task_id']:dict(deepcopy(e),model=self._entry_model(acc,e))
+                               for _,_,e in self._entries(acc) if e.get('request_id')==request_id}
         return record
 
     def archive_unknown_requests(self,bindings,note):
@@ -204,7 +266,9 @@ class AccountManager:
             for day,_,entry in self._entries(acc):
                 if entry.get('task_id')==task_id:
                     record=deepcopy(acc.get('quota_requests',{}).get(entry['request_id'],{}))
+                    if record:record.setdefault('model',MINI)
                     result=dict(account=name,date=day,**deepcopy(entry),request=record)
+                    result['model']=self._entry_model(acc,entry)
                     if entry.get('state') not in ('cancelled','rejected','archived_unknown'):return result
                     inactive=result
         return inactive if include_inactive else None
@@ -216,11 +280,14 @@ class AccountManager:
             if request.get('resolution')=='operator_archived_unknown':
                 raise ValueError('已归档的未知请求不能再次提交')
             if not request.get('submitted'):
-                quota=self._public(acc)
+                model=request.get('model') or MINI
+                today=self._today()
+                quota=self._public(acc,model)
                 old_reservations=[(day,key,entry) for day,key,entry in self._entries(acc)
                                   if entry.get('request_id')==request_id and entry.get('state')=='reserved'
-                                  and day!=self._today()]
-                if (self._day(acc).get('platform_exhausted')
+                                  and day!=today]
+                balance=self._balance(self._day(acc,today),model)
+                if (balance.get('platform_exhausted') or quota['blocked_by_model']
                         or quota['used']+quota['reserved']+quota['unknown']+len(old_reservations)>quota['limit']):
                     raise ValueError('平台余额已变化，本批次不能发送，请释放后缩小批次')
                 # A reserved-but-unsent request is charged on its actual submission day.
@@ -228,8 +295,8 @@ class AccountManager:
                     moved=[]
                     for day,key,entry in old_reservations:
                         moved.append((key,entry));del acc['quota_days'][day]['entries'][key]
-                    self._day(acc)['entries'].update(moved)
-                    request['date']=self._today()
+                    self._day(acc,today)['entries'].update(moved)
+                    request['date']=today
             request['submitted']=True
             if request.get('approval_block'):
                 request['last_approval_block']=request.pop('approval_block')
@@ -398,16 +465,34 @@ class AccountManager:
             request['refunded_task_ids']=sorted(set(request.get('refunded_task_ids',[]))|set(released))
         return released
 
-    def observe_remaining(self,name,count):
-        if isinstance(count,bool) or not isinstance(count,int) or not 0<=count<=self.daily_limit:
+    def _observation_model(self,acc,request_id):
+        if request_id is None:return self.model
+        request=acc.get('quota_requests',{}).get(request_id)
+        if not request:raise ValueError('没有此请求的额度记录')
+        # A balance found in an older submitted chat isn't evidence for the
+        # current day's allowance. Unsent requests can be moved to today.
+        if request.get('submitted') and request.get('date')!=self._today():
+            return None
+        return request.get('model') or MINI
+
+    def _observe_remaining(self,acc,count,model):
+        limit=self._model_limit(model)
+        if isinstance(count,bool) or not isinstance(count,int) or not 0<=count<=limit:
             raise ValueError('平台剩余额度必须是0至每日上限之间的整数')
+        day=self._day(acc)
+        balance=self._balance(day,model,create=True)
+        entries=[entry for entry in day['entries'].values() if self._entry_model(acc,entry)==model]
+        charged=sum(e.get('state')=='charged' for e in entries)
+        submitted=sum(e.get('state') in ('submitted','unknown') for e in entries)
+        inferred=max(0,limit-count-charged-submitted)
+        balance.update(baseline_used=max(int(balance.get('baseline_used',0)),inferred),estimated=False,
+                       observed_remaining=count,platform_exhausted=bool(balance.get('platform_exhausted')) or count==0)
+
+    def observe_remaining(self,name,count,*,request_id=None):
         with self.store.txn() as data:
-            acc=self._account(data,name);day=self._day(acc)
-            charged=sum(e.get('state')=='charged' for e in day['entries'].values())
-            submitted=sum(e.get('state') in ('submitted','unknown') for e in day['entries'].values())
-            inferred=max(0,self.daily_limit-count-charged-submitted)
-            day.update(baseline_used=max(int(day.get('baseline_used',0)),inferred),estimated=False,
-                       observed_remaining=count,platform_exhausted=bool(day.get('platform_exhausted')) or count==0)
+            acc=self._account(data,name)
+            model=self._observation_model(acc,request_id)
+            if model is not None:self._observe_remaining(acc,count,model)
 
     def pick(self):
         self.reset_daily()
@@ -415,7 +500,7 @@ class AccountManager:
             for name in self.names:
                 acc=data['accounts'].get(name,{})
                 quota=self._public(acc)
-                if (acc.get('status')==AVAILABLE and quota['remaining']>0
+                if (self._selected_status(acc,self.model,quota['date'])==AVAILABLE and quota['remaining']>0
                         and quota['pending_recovery']==0 and quota['unknown']==0
                         and quota['awaiting_approval']==0):
                     acc['status']=BUSY;return name
@@ -424,7 +509,9 @@ class AccountManager:
     def mark_busy(self,name):
         with self.store.txn() as data:
             acc=self._account(data,name)
-            if acc.get('status')==AVAILABLE:acc['status']=BUSY;return True
+            if self._selected_status(acc,self.model,self._today())==AVAILABLE:
+                acc['status']=BUSY
+                return True
             return acc.get('status')==BUSY
 
     def release(self,name):
@@ -432,20 +519,22 @@ class AccountManager:
             acc=self._account(data,name)
             if acc.get('status')==BUSY:acc['status']=AVAILABLE
 
-    def mark_exhausted(self,name,note=''):
-        self.observe_remaining(name,0)
-        self._set(name,EXHAUSTED,note or '平台提示今日额度已耗尽',mark_date=True)
+    def mark_exhausted(self,name,note='',*,request_id=None):
+        with self.store.txn() as data:
+            acc=self._account(data,name)
+            model=self._observation_model(acc,request_id)
+            if model is not None:
+                self._observe_remaining(acc,0,model)
+                self._record_status(acc,True,note or '平台提示今日额度已耗尽',model)
 
     def mark_startup_retryable(self,name,note=''):
         """Record a recoverable browser startup failure without disabling the account."""
         with self.store.txn() as data:
             acc=self._account(data,name)
             quota=self._public(acc)
-            exhausted=(self._day(acc).get('platform_exhausted')
-                       or quota['used']>=quota['limit'])
-            acc.update(status=EXHAUSTED if exhausted else AVAILABLE,
-                       note=note or '浏览器启动暂时失败，可重试')
-            acc['date']=self._today() if exhausted else ''
+            balance=self._balance(acc.get('quota_days',{}).get(quota['date'],{}),self.model)
+            exhausted=balance.get('platform_exhausted') or quota['used']>=quota['limit']
+            self._record_status(acc,exhausted,note or '浏览器启动暂时失败，可重试')
 
     def mark_needs_login(self,name,note=''):self._set(name,NEEDS_LOGIN,note or '登录失效')
     def mark_disabled(self,name,note=''):self._set(name,DISABLED,note)
@@ -459,7 +548,7 @@ class AccountManager:
     def any_available(self):
         accounts=self.store.snapshot().get('accounts',{})
         for account in accounts.values():self._normalize(account)
-        return any(accounts.get(n,{}).get('status') in (AVAILABLE,BUSY,'checking')
+        return any(self._selected_status(accounts[n],self.model,self._today()) in (AVAILABLE,BUSY,'checking')
                    and self._public(accounts[n])['remaining']>0
                    and self._public(accounts[n])['pending_recovery']==0
                    and self._public(accounts[n])['unknown']==0

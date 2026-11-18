@@ -290,6 +290,25 @@ class BatchPipelineTests(unittest.TestCase):
         self.assertEqual([seconds for _, _, seconds in self.h.trims],
                          [15, 15, 15, 5, 15, 15, 15, 15, 10])
 
+    def test_model_switch_uses_other_account_and_records_fast_capacity(self):
+        self.plan([('mini15', [15])])
+        self.pipeline.stage_run()
+        self.assertEqual(self.h.calls[-1]['context']['model'], 'mini')
+
+        self.cfg['video']['model'] = 'fast'
+        self.pipeline = self.make_pipeline()
+        self.plan([('fast45', [15, 15, 15])])
+        self.pipeline.stage_run()
+        self.assertEqual([(call['account'], len(call['task_ids']), call['context']['model'])
+                          for call in self.h.calls], [('a', 1, 'mini'), ('b', 2, 'fast'), ('c', 1, 'fast')])
+        saved = self.pipeline.store.snapshot()
+        self.assertTrue(all(task['model'] == 'fast' for task in saved['tasks']))
+        self.assertTrue(all(request['model'] == 'fast' for request in saved['requests'].values()))
+
+        self.cfg['video']['model'] = 'mini'
+        self.pipeline = self.make_pipeline()
+        self.assertEqual([self.pipeline.accounts.quota(name)['remaining'] for name in ('a', 'b', 'c')], [3, 0, 0])
+
     def test_one_remaining_unit_claims_a_single_video(self):
         self.plan([('script50', [15, 15, 15, 5])])
         self.pipeline.accounts.observe_remaining('a', 1)
@@ -388,6 +407,10 @@ class BatchPipelineTests(unittest.TestCase):
         self.assertEqual(entry['state'],'rejected')
         self.assertEqual(request['phase'],'not_generated')
         self.assertIsNone(self.pipeline._claim_batch('a'))
+        self.cfg['video']['model']='fast'
+        self.pipeline=self.make_pipeline()
+        self.pipeline._recover_state()
+        self.assertEqual(self.pipeline.accounts.quota('a')['remaining'],2)
 
     def test_charged_download_failure_is_not_released_with_other_refused_slot(self):
         self.plan([('script30',[15,15])])
@@ -757,6 +780,21 @@ class BatchPipelineTests(unittest.TestCase):
         self.assertEqual(self.h.calls[0]['context']['request_id'], 'request-before-journal')
         self.assertEqual(self.h.sent, 0)
         self.assertEqual(self.pipeline.accounts.quota('a')['used'], 2)
+
+    def test_recovering_mini_submission_after_switch_to_fast_preserves_original_model(self):
+        tasks = self.plan([('mini15', [15])])
+        task_id = tasks[0]['id']
+        self.pipeline.accounts.reserve('a', [task_id], 'recorded-mini')
+        self.pipeline.accounts.mark_submitted('a', 'recorded-mini', chat_url='https://www.doubao.com/chat/5678')
+        self.cfg['video']['model'] = 'fast'
+        self.pipeline = self.make_pipeline()
+        self.pipeline.stage_run()
+        call = self.h.calls[0]
+        self.assertTrue(call['resume_only'])
+        self.assertEqual(call['context']['model'], 'mini')
+        self.assertEqual(self.h.sent, 0)
+        self.assertEqual(self.pipeline.store.snapshot()['tasks'][0]['model'], 'mini')
+        self.assertEqual(self.pipeline.accounts.quota('a')['remaining'], 0)
 
     def test_next_batch_starts_only_after_previous_tail_is_published(self):
         self.plan([('script50', [15, 15, 15, 5])])
