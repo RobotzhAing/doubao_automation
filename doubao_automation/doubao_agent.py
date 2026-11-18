@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .config import get
-from .doubao_batch import (BatchGenerationMixin, generation_unavailable_matches,
+from .doubao_batch import (BatchGenerationMixin, _MODEL_CONTROL, generation_unavailable_matches,
                            quota_exhaustion_matches)
 from .seedance_models import MINI
 
@@ -329,12 +329,69 @@ class DoubaoAgent(BatchGenerationMixin):
             page.wait_for_timeout(250)
         raise GenerationFailed(f'[{self.name}] 找不到可用的新对话按钮，已在上传和发送前停止；仅访问 /chat/ 不代表创建成功')
 
-    # ---- 上传图片 ----
+    # ---- 上传参考附件 ----
+    def _upload_attachment_state(self):
+        editor = self._input_box()
+        if editor is None:
+            return None
+        return editor.evaluate('''editor => {
+          const composer = editor.closest('[data-testid="chat_input"]');
+          if (!composer) return null;
+          const tray = composer.querySelector('[data-testid="video-attachment-scroll-container"]');
+          const visible = element => element.getClientRects().length
+            && getComputedStyle(element).visibility !== 'hidden';
+          const cards = [...(tray?.querySelectorAll(
+            '[data-testid="attachment-image-card"], [data-testid="attachment-video-card"]') || [])].filter(visible);
+          const pending = cards.filter(card => card.matches('[class*="notClickable-"]') || [...card.querySelectorAll(
+            '[role="progressbar"][aria-label="upload progress percent"]')].some(visible));
+          return {count: cards.length, pending: pending.length};
+        }''', timeout=2000)
+
+    def _wait_uploaded_attachments(self, baseline, expected):
+        try:
+            timeout = float(self.dcfg.get('upload_timeout_seconds', 300))
+        except (TypeError, ValueError):
+            timeout = 300
+        if not 0 < timeout <= 900:
+            timeout = 300
+        deadline = time.monotonic() + timeout
+        next_report = time.monotonic() + 15
+        settled_since = None
+        confirmed, pending = 0, 0
+        while time.monotonic() < deadline:
+            try:
+                state = self._upload_attachment_state()
+            except Exception:
+                state = None  # The upload tray can remount while previews initialize.
+            now = time.monotonic()
+            if state is not None:
+                confirmed = max(0, state['count'] - baseline)
+                pending = state['pending']
+            if state is not None and confirmed == expected and pending == 0:
+                settled_since = now if settled_since is None else settled_since
+                if now - settled_since >= .5:
+                    return
+            else:
+                settled_since = None
+            if now >= next_report:
+                print(f'[{self.name}] 等待参考附件上传就绪，预览 {confirmed}/{expected}，'
+                      f'{pending} 个仍在上传', flush=True)
+                next_report = now + 15
+            self.page.wait_for_timeout(250)
+        raise GenerationFailed(f'[{self.name}] 未能确认 {expected} 个参考附件全部上传完成'
+                               f'（预览 {confirmed}/{expected}，上传中 {pending}），发送前已停止')
+
     def upload_images(self, image_paths: list):
         if not image_paths:
             return
         page = self.page
         files = [str(p) for p in image_paths]
+        skill = page.get_by_test_id('skill_input_exit_button').filter(has_text=re.compile(r'^\s*视频生成\s*$'))
+        model_control = page.get_by_role('button', name=_MODEL_CONTROL)
+        video_mode = ((skill.count() and skill.first.is_visible())
+                      or (model_control.count() and model_control.first.is_visible()))
+        before = self._upload_attachment_state() if video_mode else None
+        baseline = before['count'] if before is not None else 0
         file_input = self.sel.get("file_input", 'input[type="file"]')
         ok = False
         # A) 直接向常驻隐藏 file input 注入（豆包页面有两个 input[type=file]）
@@ -370,10 +427,16 @@ class DoubaoAgent(BatchGenerationMixin):
                 except Exception:
                     continue
         if not ok:
-            raise GenerationFailed(f"[{self.name}] 无法定位图片上传入口，请运行 dryrun-doubao 校准 file_input/open_upload")
-        settle = float(self.dcfg.get("upload_settle_seconds", 5)) * max(len(image_paths), 1)
-        page.wait_for_timeout(int(settle * 1000))
-        print(f"[{self.name}] 已上传 {len(image_paths)} 张图片")
+            raise GenerationFailed(f"[{self.name}] 无法定位参考附件上传入口，请运行 dryrun-doubao 校准 file_input/open_upload")
+        if not video_mode:
+            # dryrun-doubao stages fixtures in the original non-video composer
+            # and never sends them. Its preview-only checks remain available.
+            settle = float(self.dcfg.get('upload_settle_seconds', 5)) * len(files)
+            page.wait_for_timeout(int(settle * 1000))
+            print(f'[{self.name}] 已将 {len(files)} 个参考附件放入输入区')
+            return
+        self._wait_uploaded_attachments(baseline, len(files))
+        print(f"[{self.name}] 已确认 {len(files)} 个参考附件上传完成", flush=True)
 
     # ---- 输入与发送 ----
     def type_text(self, text: str):
