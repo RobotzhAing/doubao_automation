@@ -1248,7 +1248,14 @@ class BatchGenerationMixin:
                         try:
                             self.page.goto(target, wait_until='domcontentloaded', timeout=remaining_ms)
                         except Exception:
-                            print(f'[{self.name}] 原会话重读未完成，继续在原等待窗口内核对', flush=True)
+                            # A navigation failure can leave the renderer stuck.
+                            # Return before using any more browser locators so
+                            # the caller closes this session and keeps the
+                            # submitted request for read-only recovery.
+                            error = '原会话重读未完成，已保留原会话供恢复检查'
+                            print(f'[{self.name}] {error}', flush=True)
+                            result.update(error_kind='download' if known else 'timeout', error=error)
+                            return result
                         next_recheck = time.monotonic() + _CHAT_RECHECK_IDLE_SECONDS * 2 ** rechecks
                         if urlsplit(self.page.url)[:3] != urlsplit(target)[:3]:
                             result.update(error_kind='needs_user', error='重读后对话地址与原请求不同，已保留原请求等待核对')

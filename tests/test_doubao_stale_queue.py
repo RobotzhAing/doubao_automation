@@ -223,6 +223,25 @@ class StaleQueueTests(unittest.TestCase):
         self.assertFalse(self.generated)
         self.agent.session.context.request.get.assert_not_called()
 
+    def test_failed_reopen_leaves_bound_request_without_polling_the_stalled_page(self):
+        queue = fixtures.assistant('stale-queue', card=False, text=QUEUE_REPLY)
+        self.agent.type_and_send = lambda prompt: self._accept_turn(prompt, 'original-user', queue)
+        with patch.object(self.page, 'goto', side_effect=TimeoutError('fixture navigation timed out')) as reopen:
+            def check_dialogs():
+                self.assertFalse(reopen.called, 'a failed reread must not resume browser polling')
+
+            self.agent._handle_dialogs = check_dialogs
+            result = self._run()
+
+        reopen.assert_called_once_with(CHAT_URL, wait_until='domcontentloaded', timeout=10000)
+        self.assertEqual(result['error_kind'], 'timeout')
+        self.assertEqual(result['chat_url'], CHAT_URL)
+        self.assertTrue(result['submitted'])
+        self.assertFalse(result['continuation_safe'])
+        self.assertEqual(self.elapsed, 4)
+        self.assertEqual(len(self.agent.sent), 1)
+        self.assertFalse(self.generated)
+
     def test_short_resume_uses_one_navigation_and_caps_polling_time(self):
         for requested_seconds, expected_seconds in ((8, 8), (30, 18)):
             with self.subTest(requested_seconds=requested_seconds):
