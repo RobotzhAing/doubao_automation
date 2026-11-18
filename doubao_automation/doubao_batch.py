@@ -107,7 +107,16 @@ def choose_reply(text):
         return 'split'
     if re.search(r'(?:每次|一次|单次)[^。\n]{0,12}(?:只能|仅能|最多|只支持)[^。\n]{0,8}(?:1|一)(?:个|条|段)', text):
         return 'single'
-    if re.search(r'(确认后|确认开始|是否开始|是否继续|继续生成吗|我就开始生成|开始生成视频吗|请确认|要我.{0,12}生成)', text):
+    if re.search(r'(确认后|确认开始|是否开始|是否继续|继续生成吗|我就开始生成|开始生成视频吗|请确认)', text):
+        return 'confirm'
+    # Require an offer to generate the video itself. A prompt-writing offer
+    # may mention video generation without offering to submit any work.
+    if re.search(
+        r'(?:要不要我|要我)\s*(?:现在(?:就)?|立即|马上)?\s*(?:(?:为你|帮你)\s*)?'
+        r'(?:按(?:这份|上述|以上)提示词\s*[，,]?\s*)?(?:直接\s*)?'
+        r'(?:(?:提交|开始)\s*)?生成\s*(?:(?:这|该|一)条\s*)?(?:\d{1,2}\s*秒\s*)?视频'
+        r'\s*(?:[？?]|[吗么](?:[？?]|$))', text,
+    ):
         return 'confirm'
     return ''
 

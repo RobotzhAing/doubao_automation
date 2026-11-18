@@ -279,6 +279,12 @@ class BatchTests(unittest.TestCase):
         self.assertIsNone(quota_remaining('每天4次，每次最多2条'))
         self.assertEqual(choose_reply('方案1压缩为15秒，方案2分成两段，请选择'),'split')
 
+    def test_parser_requires_an_offer_to_generate_a_video_not_just_its_prompt(self):
+        self.assertEqual(choose_reply('要不要我现在就按这份提示词，直接提交生成这条 15 秒视频？'), 'confirm')
+        self.assertEqual(choose_reply('要我帮你生成视频吗？'), 'confirm')
+        self.assertEqual(choose_reply('要不要我现在就帮你写一份视频生成提示词？'), '')
+        self.assertEqual(choose_reply('要我帮你生成视频提示词吗？'), '')
+
     def test_failed_first_card_does_not_steal_successful_second_slot(self):
         failed={'kind':'card','status':'failed','card_position':0}
         ready={'kind':'card','status':'ready','card_position':1,'stable':'card:msg:1','url':'',
