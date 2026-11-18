@@ -57,10 +57,12 @@ def generation_unavailable_matches(text):
     """Match an assistant's explicit statement that it cannot render a video."""
     normalized = ' '.join((text or '').split())
     patterns = (
-        r'(?:我)?(?:目前|暂时)?(?:无法|不能|不支持)[^。！？\n]{0,40}'
-        r'(?:生成|渲染|制作|创建)[^。！？\n]{0,16}(?:视频|下载文件|成品)',
+        r'(?:无法|不能|不支持)[^。！？，,；;\n]{0,40}'
+        r'(?:生成|渲染|制作|创建)[^。！？，,；;\n]{0,16}(?:视频|下载文件|成品)',
+        r'(?:无法|不能|不支持)\s*(?:直接\s*)?(?:执行\s*)?视频\s*(?:渲染|生成)(?:输出)?'
+        r'(?=$|[\s。！？，,；;])',
         r'(?:unable to|cannot|can\'t|do not have the ability to)'
-        r'[^.!?\n]{0,40}(?:generate|render|create)[^.!?\n]{0,16}video',
+        r'[^,.!?;\n]{0,40}(?:generate|render|create)[^,.!?;\n]{0,16}video',
     )
     return any(re.search(pattern, normalized, re.IGNORECASE) for pattern in patterns)
 

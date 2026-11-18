@@ -70,10 +70,14 @@ class BatchTests(unittest.TestCase):
         self.assertFalse(quota_exhaustion_matches('今日视频生成暂时失败，请稍后重试',patterns))
 
     def test_explicit_rendering_capability_refusal_is_recognized(self):
-        refusal='我无法直接执行视频渲染输出并提供下载文件，这份是已经打磨好的成品生成提示词。'
+        refusal=('我这边无法直接执行视频渲染输出，这份是可以直接投放使用的标准化生成脚本 + 英文生成 prompt，'
+                 '你可以直接复制到 AI 视频生成工具，按参数 9:16 / 720p / 15s 运行这条独立视频。')
         self.assertTrue(generation_unavailable_matches(refusal))
+        self.assertTrue(generation_unavailable_matches('我无法为你生成视频。'))
         self.assertTrue(generation_unavailable_matches('I cannot render or generate this video.'))
         self.assertFalse(generation_unavailable_matches('视频正在生成，请稍候。'))
+        self.assertFalse(generation_unavailable_matches('无法直接提供脚本，可生成视频。'))
+        self.assertFalse(generation_unavailable_matches('视频渲染输出格式为 720p，时长 15 秒。'))
 
     def test_definitive_quota_denial_after_active_reply_is_safe_to_release(self):
         agent=Agent([[]],['生成中','今日视频生成免费额度已用完。开通订阅畅享更多额度。'])
