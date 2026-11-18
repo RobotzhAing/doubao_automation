@@ -493,6 +493,19 @@ class BatchGenerationMixin:
             const content = node.querySelector('[data-testid="message_text_content"]');
             return norm(content ? content.textContent : node.textContent);
           };
+          // The reply can contain clickable suggested questions after its
+          // visible text. These shortcuts are not assistant statements.
+          const suggestions = '[data-testid="suggest_message_list"], [data-testid="suggest_message_item"]';
+          const assistantReply = node => {
+            if (node.matches(suggestions)) return '';
+            if (!node.querySelector(suggestions)) return node.innerText || '';
+            return [...node.childNodes].map(child => {
+              if (child.nodeType === Node.TEXT_NODE) return child.textContent;
+              if (child instanceof HTMLElement && child.getClientRects().length &&
+                  getComputedStyle(child).visibility !== 'hidden') return assistantReply(child);
+              return '';
+            }).filter(text => text.trim()).join('\\n').trim();
+          };
           const canonical = [...document.querySelectorAll('[data-testid="send_message"], [data-testid="receive_message"]')];
           const canonicalRoots = canonical.filter((node, index, all) =>
             !all.some((other, j) => j !== index && other.contains(node)));
@@ -562,7 +575,7 @@ class BatchGenerationMixin:
             const confirmationIndex = confirmation ? messages.indexOf(confirmation) : -1;
             const previousAssistant = confirmationIndex > 0
               ? [...messages.slice(0, confirmationIndex)].reverse().find(node => !user(node)) : null;
-            const previousText = previousAssistant ? messageText(previousAssistant) : '';
+            const previousText = previousAssistant ? norm(assistantReply(previousAssistant)) : '';
             const askedToConfirm = /确认后.{0,80}开始生成|请.{0,40}确认.{0,80}(?:开始|生成)|(?:需要|等待).{0,30}确认.{0,80}(?:开始|生成)/.test(previousText);
             const followsOwner = !anchors.length || messages.indexOf(anchors[0]) < confirmationIndex;
             if (confirmation && userTurns.at(-1) === confirmation && askedToConfirm && followsOwner) {
@@ -606,7 +619,7 @@ class BatchGenerationMixin:
           }
           // A confirmation user turn can be mounted before its answer. Do
           // not act again on the assistant confirmation that preceded it.
-          metadata.latest_reply = latestOwned && !user(latestOwned) ? latestOwned.innerText : '';
+          metadata.latest_reply = latestOwned && !user(latestOwned) ? assistantReply(latestOwned) : '';
           metadata.latest_reply_message_id = latestOwned && !user(latestOwned) ? id(latestOwned) : '';
           const cards=[];
           const selector='[class*="block-video-"],[class*="fulfill-video-error-box-"]';
@@ -1084,8 +1097,10 @@ class BatchGenerationMixin:
                 if not controls_current or reply==baseline.get('assistant_before'):
                     reply=''
                 action = choose_reply(reply)
-                active = any(k in reply for k in ('正在生成', '生成中', '排队中', '预计等待', '生成任务已提交'))
-                remote_started |= active or bool(known)
+                rendering = any(k in reply for k in ('正在生成', '生成中', '排队中', '预计等待', '生成任务已提交'))
+                analyzing = bool(re.search(r'(?:参考)?视频解析(?:大约|预计)需要|(?:参考)?视频解析中|正在解析(?:参考)?视频', reply))
+                active = rendering or analyzing
+                remote_started |= rendering or bool(known)
                 if (not known and not assets and not cards and not active and reply
                         and getattr(self,'_last_reply_source','')=='latest_assistant'
                         and generation_unavailable_matches(reply)):
@@ -1194,9 +1209,9 @@ class BatchGenerationMixin:
                         self.type_and_send(followup)
                         deadline = time.monotonic() + timeout
                         next_recheck = time.monotonic() + _CHAT_RECHECK_IDLE_SECONDS * 2 ** rechecks
-                if controls_current and not any(k in reply for k in ('正在生成', '生成中', '排队', '预计等待')):
-                    if (not action and not active and getattr(self,'_last_reply_source','')=='latest_assistant'
-                            and quota_exhaustion_matches(reply, self.quota_patterns)):
+                if (controls_current and not active and '排队' not in reply
+                        and getattr(self,'_last_reply_source','') == 'latest_assistant'):
+                    if not action and quota_exhaustion_matches(reply, self.quota_patterns):
                         self._save_batch_debug(context,reply)
                         result.update(error_kind='quota', error='豆包提示视频生成次数已用完',
                                       # This is a fresh, explicit quota denial and the

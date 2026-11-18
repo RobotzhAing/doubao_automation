@@ -118,6 +118,18 @@ class AssetOwnershipTests(unittest.TestCase):
         self.assertTrue(assets[0]['ownership_verified'])
         self.assertEqual(self.agent._assistant_text(), 'office ready')
 
+    def test_owned_assistant_reply_excludes_suggested_questions(self):
+        reply = '当前视频解析大约需要 1 分钟，请耐心等待哦，回答完成后我会主动发送给你。'
+        self.page.set_content(self.own_user() + '<section data-message-id="analysis-answer">'
+                              '<div data-testid="receive_message">'
+                              f'<div><p>{reply}</p><div data-testid="suggest_message_list">'
+                              '<button data-testid="suggest_message_item">视频生成失败了怎么办？</button></div></div>'
+                              '<button>继续等待</button>'
+                              '<button data-testid="suggest_message_item">视频生成好了吗？</button></div></section>')
+        self.assertEqual(self.agent._batch_assets(), [])
+        self.assertEqual(self.agent._assistant_text(), reply + '\n继续等待')
+        self.assertEqual(self.agent._batch_scope_state['latest_reply_message_id'], 'analysis-answer')
+
     def test_collapsed_long_user_turn_is_expanded_to_find_tail_marker(self):
         collapsed = ('<section data-message-id="owner"><div data-testid="send_message" '
                      'data-message-role="user"><div data-testid="message_text_content">'

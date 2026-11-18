@@ -89,6 +89,19 @@ class BatchTests(unittest.TestCase):
         self.assertFalse(generated)
         self.assertEqual(len(agent.sent),1)
 
+    def test_reference_analysis_keeps_polling_and_allows_a_real_later_confirmation(self):
+        a,b=asset('https://cdn/one.mp4'),asset('https://cdn/two.mp4',1)
+        agent=Agent([[],[],[],[a,b]],[
+            '当前视频解析大约需要 1 分钟，请耐心等待哦，回答完成后我会主动发送给你。视频生成失败了怎么办？',
+            '请确认后开始生成。',
+        ])
+        agent.failure_patterns=[re.compile('视频生成失败')]
+        result,generated,_=self.run_agent(agent)
+        self.assertFalse(result['unresolved'])
+        self.assertEqual(len(generated),2)
+        self.assertEqual(len(agent.sent),2)
+        self.assertIn('立即开始生成',agent.sent[1])
+
     def test_capability_refusal_stops_polling_without_claiming_video_was_generated(self):
         refusal='我无法直接执行视频渲染输出并提供下载文件，这份是已经打磨好的成品生成提示词。'
         agent=Agent([[]],[refusal])
