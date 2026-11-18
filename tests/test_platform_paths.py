@@ -91,7 +91,13 @@ class BrowserDefaultsTests(unittest.TestCase):
         driver.chromium.launch_persistent_context.side_effect = launch_side_effect or [context]
         controller = MagicMock()
         controller.start.return_value = driver
-        with patch.object(sys, "platform", platform), patch.object(sync_api, "sync_playwright", return_value=controller), patch.object(Path, "is_file", return_value=True):
+        environment = {"PROGRAMFILES": str(ROOT / "simulated_programs")} if platform == "win32" else {}
+        with (
+            patch.object(sys, "platform", platform),
+            patch.dict(os.environ, environment, clear=True),
+            patch.object(sync_api, "sync_playwright", return_value=controller),
+            patch.object(Path, "is_file", return_value=True),
+        ):
             agent.start()
         return driver.chromium.launch_persistent_context.call_args_list
 
